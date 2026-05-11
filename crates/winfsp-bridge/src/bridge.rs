@@ -17,9 +17,7 @@ use windows::Win32::Foundation::{
     STATUS_END_OF_FILE, STATUS_FILE_IS_A_DIRECTORY, STATUS_IO_DEVICE_ERROR, STATUS_NOT_A_DIRECTORY,
     STATUS_OBJECT_NAME_NOT_FOUND,
 };
-use windows::Win32::Storage::FileSystem::{
-    FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
-};
+use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY};
 use winfsp::filesystem::{
     DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo, VolumeInfo,
     WideNameInfo,
@@ -141,7 +139,7 @@ impl FileSystemContext for Bridge {
         &self,
         file_name: &U16CStr,
         _create_options: u32,
-        _granted_access: FILE_ACCESS_RIGHTS,
+        _granted_access: u32,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
         let path = winfsp_path_to_posix(file_name);
@@ -211,8 +209,9 @@ impl FileSystemContext for Bridge {
 
         // WinFsp pages directory results: `marker`, if present, names
         // the last entry the kernel saw, and we must emit entries that
-        // sort strictly after it.
-        let marker_str: Option<String> = marker.inner().map(|m| m.to_string_lossy());
+        // sort strictly after it. `marker.inner()` is a raw UTF-16 slice
+        // (no NUL terminator).
+        let marker_str: Option<String> = marker.inner().map(String::from_utf16_lossy);
         let mut started = marker_str.is_none();
         let mut cursor: u32 = 0;
 
@@ -241,7 +240,7 @@ impl FileSystemContext for Bridge {
 /// A live, mounted filesystem. Drop or call [`MountedHost::unmount`]
 /// to tear it down.
 pub struct MountedHost {
-    host: FileSystemHost<'static>,
+    host: FileSystemHost<Bridge>,
 }
 
 impl MountedHost {

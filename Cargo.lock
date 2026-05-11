@@ -210,6 +210,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "winfsp-bridge",
+ "winfsp_build",
 ]
 
 [[package]]
@@ -4309,6 +4310,12 @@ checksum = "d42acc30c105f8d33507f556398237c738b681271c775a3b94eefd29d2b8c77e"
 dependencies = [
  "bindgen",
 ]
+
+[[package]]
+name = "winfsp_build"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d23742089c43c004a61152e4e456e02fcb2ab7701b317242e9cc1c30a4ad363e"
 
 [[package]]
 name = "winit"

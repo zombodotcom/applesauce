@@ -11,6 +11,9 @@ description = "Mount a Mac drive or image as a Windows drive letter via WinFsp"
 name = "applesauce-mount"
 path = "src/main.rs"
 
+[target.'cfg(windows)'.build-dependencies]
+winfsp_build = "0.1"
+
 [target.'cfg(windows)'.dependencies]
 anyhow.workspace = true
 tracing.workspace = true

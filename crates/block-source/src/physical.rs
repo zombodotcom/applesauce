@@ -52,10 +52,8 @@ pub fn enumerate() -> Vec<DiskInfo> {
 
 fn peek(drive_number: u32) -> io::Result<DiskInfo> {
     let handle = open_handle(drive_number)?;
-    let length = query_length(handle).inspect_err(|_e| {
-        unsafe {
-            let _ = CloseHandle(handle);
-        }
+    let length = query_length(handle).inspect_err(|_e| unsafe {
+        let _ = CloseHandle(handle);
     })?;
     unsafe {
         let _ = CloseHandle(handle);

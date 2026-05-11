@@ -15,6 +15,11 @@ fn main() {
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
+    win::run()
+}
+
+#[cfg(windows)]
+mod win {
     use std::env;
     use std::process::ExitCode;
     use std::sync::mpsc;
@@ -25,20 +30,30 @@ fn main() -> std::process::ExitCode {
     use block_source::BlockSource;
     use fs_core::hfsplus::Hfsplus;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    pub fn run() -> ExitCode {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .init();
 
-    let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
-        print_usage();
-        return ExitCode::SUCCESS;
+        let args: Vec<String> = env::args().skip(1).collect();
+        if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
+            print_usage();
+            return ExitCode::SUCCESS;
+        }
+
+        match drive(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("applesauce-mount: {e:#}");
+                ExitCode::FAILURE
+            }
+        }
     }
 
-    let result = (|| -> anyhow::Result<()> {
+    fn drive(args: &[String]) -> anyhow::Result<()> {
         let (mountpoint, host) = match args[0].as_str() {
             "--disk" => {
                 let n: u32 = args
@@ -75,14 +90,6 @@ fn main() -> std::process::ExitCode {
         eprintln!("unmounting…");
         host.unmount();
         Ok(())
-    })();
-
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("applesauce-mount: {e:#}");
-            ExitCode::FAILURE
-        }
     }
 
     fn print_usage() {
