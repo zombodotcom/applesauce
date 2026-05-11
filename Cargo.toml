@@ -13,7 +13,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/REPLACE_ME/applesauce"
+repository = "https://github.com/zombodotcom/applesauce"
 rust-version = "1.94"
 
 [workspace.dependencies]

@@ -1,5 +1,9 @@
 # applesauce
 
+[![ci](https://github.com/zombodotcom/applesauce/actions/workflows/ci.yml/badge.svg)](https://github.com/zombodotcom/applesauce/actions/workflows/ci.yml)
+[![release](https://github.com/zombodotcom/applesauce/actions/workflows/release.yml/badge.svg)](https://github.com/zombodotcom/applesauce/actions/workflows/release.yml)
+[![license: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 Read Mac hard drives on Windows. Free and open source.
 
 `applesauce` mounts HFS+ and APFS volumes as Windows drive letters so you
@@ -31,6 +35,12 @@ Four-piece workspace:
 - [WinFsp](https://winfsp.dev/) (bundled by the installer)
 - Administrator privileges to read raw physical disks (not needed for
   image files)
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the running build/feature log.
+Tagged releases produce a draft GitHub Release with a Windows x86_64
+zip on the [Releases page](https://github.com/zombodotcom/applesauce/releases).
 
 ## License
 
