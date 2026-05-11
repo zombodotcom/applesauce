@@ -25,6 +25,11 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install LLVM (for bindgen / libclang)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18"
+
       - name: Install WinFsp
         shell: pwsh
         run: |
@@ -33,11 +38,11 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile $msi
           Start-Process msiexec.exe -Wait -ArgumentList "/i `"$msi`" /qn /norestart"
 
-      - name: Build release binaries (without WinFsp-dependent crates)
-        run: cargo build --release --workspace
+      - name: Build default-members (no WinFsp deps)
+        run: cargo build --release
 
-      - name: Build mount binary (requires WinFsp)
-        run: cargo build --release -p applesauce-mount --features winfsp-bridge/mount
+      - name: Build applesauce-mount (with WinFsp)
+        run: cargo build --release -p applesauce-mount
         continue-on-error: true
 
       - name: Resolve tag name

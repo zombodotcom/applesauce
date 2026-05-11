@@ -1,9 +1,15 @@
 //! WinFsp glue layer.
 //!
 //! Adapts a `fs_core::MacFilesystem` to a WinFsp `FileSystemContext`,
-//! letting Windows mount Mac volumes as drive letters.
+//! exposing the volume as a Windows drive letter.
 //!
-//! Stubbed for the initial scaffold; real implementation lands once
-//! the HFS+ reader is end-to-end.
+//! The actual bridge is gated behind the `mount` Cargo feature so that
+//! the rest of the workspace builds without WinFsp installed.
 
 #![deny(rust_2018_idioms)]
+
+#[cfg(all(windows, feature = "mount"))]
+mod bridge;
+
+#[cfg(all(windows, feature = "mount"))]
+pub use bridge::{mount, Bridge, MountedHost};

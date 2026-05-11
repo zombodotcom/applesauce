@@ -1,0 +1,21 @@
+[package]
+name = "applesauce-mount"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Mount a Mac drive or image as a Windows drive letter via WinFsp"
+
+[[bin]]
+name = "applesauce-mount"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ctrlc = "3"
+block-source = { path = "../../crates/block-source" }
+fs-core = { path = "../../crates/fs-core" }
+winfsp-bridge = { path = "../../crates/winfsp-bridge", features = ["mount"] }

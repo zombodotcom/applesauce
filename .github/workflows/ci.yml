@@ -11,8 +11,11 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  # Fast lane: builds the default-members workspace (no WinFsp, no
+  # libclang). Covers block-source, fs-core, applesauce-cat,
+  # applesauce-parts, applesauce-gui.
   check:
-    name: cargo check / fmt / clippy / test
+    name: fmt / clippy / check / test (no WinFsp)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,11 +31,44 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
-      - name: cargo check (default members, no WinFsp)
-        run: cargo check --workspace --all-targets
+      - name: cargo check
+        run: cargo check --all-targets
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -Dwarnings
+        run: cargo clippy --all-targets -- -Dwarnings
 
       - name: cargo test
-        run: cargo test --workspace --all-targets
+        run: cargo test --all-targets
+
+  # WinFsp lane: builds applesauce-mount + winfsp-bridge with the
+  # `mount` feature. Requires WinFsp SDK + LLVM (for bindgen).
+  mount:
+    name: build applesauce-mount (with WinFsp)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install LLVM (for bindgen / libclang)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18"
+
+      - name: Install WinFsp
+        shell: pwsh
+        run: |
+          $url = "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
+          $msi = "$env:RUNNER_TEMP\winfsp.msi"
+          Invoke-WebRequest -Uri $url -OutFile $msi
+          Start-Process msiexec.exe -Wait -ArgumentList "/i `"$msi`" /qn /norestart"
+
+      - name: cargo build -p applesauce-mount
+        run: cargo build -p applesauce-mount
+
+      - name: cargo clippy -p applesauce-mount
+        run: cargo clippy -p applesauce-mount -- -Dwarnings
