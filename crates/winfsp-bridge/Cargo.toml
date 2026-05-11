@@ -1,0 +1,18 @@
+[package]
+name = "winfsp-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "WinFsp glue that mounts an fs-core MacFilesystem as a Windows drive letter"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+fs-core = { path = "../fs-core" }
+
+# NOTE: winfsp dep is added when this crate is implemented in week 3.
+# Keeping it out of the initial scaffold so the workspace builds without
+# WinFsp installed on the system.

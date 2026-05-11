@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/block-source",
+    "crates/fs-core",
+    "crates/winfsp-bridge",
+    "apps/applesauce-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/REPLACE_ME/applesauce"
+rust-version = "1.94"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+binrw = "0.14"
+byteorder = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

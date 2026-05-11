@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Test fixtures we don't want committed (large or licensed images)
+/tests/fixtures/private/
+
+# IDE
+.vscode/
+.idea/
+*.swp

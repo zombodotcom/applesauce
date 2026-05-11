@@ -1,0 +1,16 @@
+[package]
+name = "fs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Mac filesystem readers (HFS+, APFS) for the applesauce project"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+binrw.workspace = true
+byteorder.workspace = true
+block-source = { path = "../block-source" }

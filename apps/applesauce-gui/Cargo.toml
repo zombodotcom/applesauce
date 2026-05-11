@@ -1,0 +1,24 @@
+[package]
+name = "applesauce-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "applesauce — mount Mac drives as Windows drive letters"
+
+[[bin]]
+name = "applesauce"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+eframe = "0.29"
+egui = "0.29"
+block-source = { path = "../../crates/block-source" }
+fs-core = { path = "../../crates/fs-core" }
+
+[target.'cfg(windows)'.dependencies]
+winfsp-bridge = { path = "../../crates/winfsp-bridge" }
