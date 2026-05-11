@@ -196,7 +196,9 @@ dependencies = [
  "fs-core",
  "tracing",
  "tracing-subscriber",
+ "windows 0.58.0",
  "winfsp-bridge",
+ "winfsp_build",
 ]
 
 [[package]]

@@ -20,5 +20,13 @@ egui = "0.29"
 block-source = { path = "../../crates/block-source" }
 fs-core = { path = "../../crates/fs-core" }
 
+[target.'cfg(windows)'.build-dependencies]
+winfsp_build = "0.1"
+
 [target.'cfg(windows)'.dependencies]
-winfsp-bridge = { path = "../../crates/winfsp-bridge" }
+winfsp-bridge = { path = "../../crates/winfsp-bridge", features = ["mount"] }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }

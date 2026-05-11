@@ -9,15 +9,16 @@ members = [
     "apps/applesauce-mount",
     "apps/applesauce-parts",
 ]
-# `cargo build` / `cargo check` from the root skips applesauce-mount, so
-# the workspace builds without WinFsp installed. Build the mount binary
-# explicitly with `cargo build -p applesauce-mount`.
+# `cargo build` / `cargo check` from the root skips the WinFsp-bound
+# binaries (applesauce-mount, applesauce-gui), so the workspace builds
+# without WinFsp + LLVM installed. Build them explicitly:
+#   cargo build -p applesauce-mount
+#   cargo build -p applesauce-gui   (or `cargo run --bin applesauce`)
 default-members = [
     "crates/block-source",
     "crates/fs-core",
     "crates/winfsp-bridge",
     "apps/applesauce-cat",
-    "apps/applesauce-gui",
     "apps/applesauce-parts",
 ]
 
