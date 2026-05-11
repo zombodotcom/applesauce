@@ -52,11 +52,10 @@ pub fn enumerate() -> Vec<DiskInfo> {
 
 fn peek(drive_number: u32) -> io::Result<DiskInfo> {
     let handle = open_handle(drive_number)?;
-    let length = query_length(handle).map_err(|e| {
+    let length = query_length(handle).inspect_err(|_e| {
         unsafe {
             let _ = CloseHandle(handle);
         }
-        e
     })?;
     unsafe {
         let _ = CloseHandle(handle);
@@ -100,7 +99,7 @@ impl PhysicalDisk {
         Ok(Self {
             inner,
             sector_size: 512, // Conservative default. Refine via
-                              // IOCTL_DISK_GET_DRIVE_GEOMETRY_EX later.
+            // IOCTL_DISK_GET_DRIVE_GEOMETRY_EX later.
             length,
             pos: 0,
             cache: vec![0; CACHE_SIZE],
@@ -196,9 +195,7 @@ fn open_handle(drive_number: u32) -> io::Result<HANDLE> {
             FILE_ATTRIBUTE_NORMAL,
             None,
         )
-        .map_err(|e: windows::core::Error| {
-            io::Error::new(io::ErrorKind::Other, e.message())
-        })
+        .map_err(|e: windows::core::Error| io::Error::other(e.message()))
     }
 }
 
@@ -218,7 +215,7 @@ fn query_length(handle: HANDLE) -> io::Result<u64> {
         )
     };
     if let Err(e) = ok {
-        return Err(io::Error::new(io::ErrorKind::Other, e.message()));
+        return Err(io::Error::other(e.message()));
     }
     let info = unsafe { info.assume_init() };
     Ok(info.Length as u64)

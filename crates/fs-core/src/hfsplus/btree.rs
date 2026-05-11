@@ -99,11 +99,7 @@ impl Node {
 
 /// Read node `node_num` of size `node_size` from a Read+Seek source
 /// (typically a `ForkReader` over the tree's fork).
-pub fn read_node<S: Read + Seek>(
-    source: &mut S,
-    node_num: u32,
-    node_size: u16,
-) -> Result<Node> {
+pub fn read_node<S: Read + Seek>(source: &mut S, node_num: u32, node_size: u16) -> Result<Node> {
     let node_size = node_size as usize;
     source.seek(SeekFrom::Start(node_num as u64 * node_size as u64))?;
 
@@ -146,7 +142,9 @@ pub fn read_node<S: Read + Seek>(
 /// Read the B-tree header record from node 0 of `source`. Returns the
 /// header along with the node descriptor (so callers can sanity-check
 /// kind == NodeKind::Header).
-pub fn read_btree_header<S: Read + Seek>(source: &mut S) -> Result<(NodeDescriptor, BTreeHeaderRecord)> {
+pub fn read_btree_header<S: Read + Seek>(
+    source: &mut S,
+) -> Result<(NodeDescriptor, BTreeHeaderRecord)> {
     // The header node has node_size = 512 minimum (or the value already
     // recorded inside the header). We have a chicken-and-egg: we need
     // node_size to know how much to read for node 0. Apple's spec

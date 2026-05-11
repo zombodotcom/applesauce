@@ -46,6 +46,11 @@ impl<'a, S: Read + Seek> ForkReader<'a, S> {
         self.fork.logical_size
     }
 
+    /// Whether the fork has zero logical bytes.
+    pub fn is_empty(&self) -> bool {
+        self.fork.logical_size == 0
+    }
+
     /// Translate a logical byte offset into a disk byte offset and the
     /// number of contiguous bytes available from there. Returns
     /// `Ok(None)` past EOF, and `Err` if the byte falls in an extent
@@ -68,9 +73,8 @@ impl<'a, S: Read + Seek> ForkReader<'a, S> {
 
             if logical < extent_end_logical {
                 let offset_in_extent = logical - extent_start_logical;
-                let disk_offset = self.volume_offset
-                    + extent.start_block as u64 * block_size
-                    + offset_in_extent;
+                let disk_offset =
+                    self.volume_offset + extent.start_block as u64 * block_size + offset_in_extent;
                 let bytes_left_in_extent = extent_len_bytes - offset_in_extent;
                 // Don't return more than the logical size.
                 let bytes_to_eof = self.fork.logical_size - logical;
@@ -82,8 +86,7 @@ impl<'a, S: Read + Seek> ForkReader<'a, S> {
 
         // Logical offset is within logical_size but not covered by the
         // inline extents: must be in the extents overflow B-tree.
-        Err(io::Error::new(
-            io::ErrorKind::Other,
+        Err(io::Error::other(
             "fork extent outside inline list (overflow B-tree not yet supported)",
         ))
     }
@@ -138,9 +141,15 @@ mod tests {
     use std::io::Cursor;
 
     fn fork_with(extents: &[(u32, u32)], logical_size: u64) -> HFSPlusForkData {
-        let mut e = [HFSPlusExtentDescriptor { start_block: 0, block_count: 0 }; 8];
+        let mut e = [HFSPlusExtentDescriptor {
+            start_block: 0,
+            block_count: 0,
+        }; 8];
         for (i, &(s, c)) in extents.iter().enumerate() {
-            e[i] = HFSPlusExtentDescriptor { start_block: s, block_count: c };
+            e[i] = HFSPlusExtentDescriptor {
+                start_block: s,
+                block_count: c,
+            };
         }
         let total_blocks: u32 = extents.iter().map(|&(_, c)| c).sum();
         HFSPlusForkData {
@@ -183,7 +192,7 @@ mod tests {
         let mut src = Cursor::new(disk);
         let mut reader = ForkReader::new(&mut src, 0, block_size, fork);
 
-        let mut out = vec![0u8; 32];
+        let mut out = [0u8; 32];
         // Loop because each .read() returns only up to the end of one extent
         let mut total = 0;
         while total < 32 {

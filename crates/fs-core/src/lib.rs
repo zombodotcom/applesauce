@@ -6,8 +6,8 @@
 
 #![deny(rust_2018_idioms)]
 
-pub mod hfsplus;
 pub mod apfs;
+pub mod hfsplus;
 
 use std::time::SystemTime;
 
@@ -33,7 +33,8 @@ pub trait MacFilesystem: Send {
     fn stat(&mut self, path: &str) -> anyhow::Result<Stat>;
 
     /// Read a range of bytes from a file.
-    fn read_file_range(&mut self, path: &str, offset: u64, buf: &mut [u8]) -> anyhow::Result<usize>;
+    fn read_file_range(&mut self, path: &str, offset: u64, buf: &mut [u8])
+        -> anyhow::Result<usize>;
 
     /// Human-readable volume label, if available.
     fn volume_label(&self) -> Option<&str>;

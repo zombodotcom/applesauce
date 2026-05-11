@@ -266,7 +266,7 @@ mod tests {
 
     fn key_bytes(parent_id: u32, name: &str) -> Vec<u8> {
         let units: Vec<u16> = name.encode_utf16().collect();
-        let key_len: u16 = (4 + 2 + units.len() as u16 * 2) as u16;
+        let key_len: u16 = 4 + 2 + units.len() as u16 * 2;
         let mut out = Vec::new();
         out.extend_from_slice(&key_len.to_be_bytes());
         out.extend_from_slice(&parent_id.to_be_bytes());

@@ -13,19 +13,19 @@ use std::time::SystemTime;
 
 use anyhow::Context as _;
 use fs_core::{MacFilesystem, Stat};
+use windows::Win32::Foundation::{
+    STATUS_END_OF_FILE, STATUS_FILE_IS_A_DIRECTORY, STATUS_IO_DEVICE_ERROR, STATUS_NOT_A_DIRECTORY,
+    STATUS_OBJECT_NAME_NOT_FOUND,
+};
+use windows::Win32::Storage::FileSystem::{
+    FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
+};
 use winfsp::filesystem::{
     DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo, VolumeInfo,
     WideNameInfo,
 };
 use winfsp::host::{FileSystemHost, VolumeParams};
 use winfsp::{FspError, U16CStr};
-use windows::Win32::Foundation::{
-    STATUS_END_OF_FILE, STATUS_FILE_IS_A_DIRECTORY, STATUS_IO_DEVICE_ERROR,
-    STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
-};
-use windows::Win32::Storage::FileSystem::{
-    FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
-};
 
 /// 100ns intervals between Windows FILETIME epoch (1601-01-01) and the
 /// Unix epoch (1970-01-01).

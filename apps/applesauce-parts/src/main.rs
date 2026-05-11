@@ -63,9 +63,7 @@ fn cmd_list_disks() -> anyhow::Result<()> {
     {
         let disks = block_source::physical::enumerate();
         if disks.is_empty() {
-            eprintln!(
-                "No physical disks visible. Are you running as Administrator?"
-            );
+            eprintln!("No physical disks visible. Are you running as Administrator?");
             return Ok(());
         }
         println!("{:<6}  {:>18}", "DISK", "BYTES");
@@ -105,7 +103,11 @@ fn cmd_image(path: &str) -> anyhow::Result<()> {
 
 fn print_header(len: Option<u64>) {
     match len {
-        Some(b) => println!("disk size: {} bytes ({:.2} GiB)", b, b as f64 / (1u64 << 30) as f64),
+        Some(b) => println!(
+            "disk size: {} bytes ({:.2} GiB)",
+            b,
+            b as f64 / (1u64 << 30) as f64
+        ),
         None => println!("disk size: unknown"),
     }
 }
@@ -116,8 +118,8 @@ fn print_partitions(parts: &[Partition]) {
         return;
     }
     println!(
-        "{:<3}  {:<26}  {:<40}  {:>16}  {:>16}  {}",
-        "#", "NAME", "TYPE", "START", "LENGTH", "MAC?"
+        "{:<3}  {:<26}  {:<40}  {:>16}  {:>16}  MAC?",
+        "#", "NAME", "TYPE", "START", "LENGTH"
     );
     for (i, p) in parts.iter().enumerate() {
         println!(

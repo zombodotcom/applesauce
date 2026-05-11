@@ -112,8 +112,9 @@ fn open_first_hfsplus<S: BlockSource + 'static>(
 
     let chosen: Option<Partition> = parts
         .iter()
-        .find(|p| matches!(p.scheme, PartitionScheme::Gpt | PartitionScheme::Apm)
-            && p.is_mac_filesystem())
+        .find(|p| {
+            matches!(p.scheme, PartitionScheme::Gpt | PartitionScheme::Apm) && p.is_mac_filesystem()
+        })
         .cloned();
 
     let (start, length) = match chosen {
@@ -150,7 +151,7 @@ fn cmd_ls<S: std::io::Read + std::io::Seek + Send>(
         println!("(empty)");
         return Ok(());
     }
-    println!("{:<8}  {:>14}  {}", "KIND", "SIZE", "NAME");
+    println!("{:<8}  {:>14}  NAME", "KIND", "SIZE");
     for e in entries {
         println!(
             "{:<8}  {:>14}  {}",

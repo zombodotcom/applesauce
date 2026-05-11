@@ -9,9 +9,7 @@ use anyhow::{anyhow, bail, Result};
 use crate::{DirEntry, MacFilesystem, Stat};
 
 use super::btree::{read_btree_header, read_node, BTreeHeaderRecord, NodeKind};
-use super::catalog::{
-    compare_keys, parse_key, parse_record_data, CatalogKey, CatalogRecord,
-};
+use super::catalog::{compare_keys, parse_key, parse_record_data, CatalogKey, CatalogRecord};
 use super::fork::HFSPlusForkData;
 use super::fork_reader::ForkReader;
 use super::types::{HfsCatalogNodeID, ROOT_FOLDER_ID};
@@ -39,7 +37,7 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
                 &mut source,
                 volume_offset,
                 volume_header.block_size,
-                volume_header.catalog_file.clone(),
+                volume_header.catalog_file,
             );
             let (_desc, hdr) = read_btree_header(&mut catalog_reader)?;
             hdr
@@ -87,9 +85,9 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
                 Some(NodeKind::Index) => {
                     let mut chosen: Option<u32> = None;
                     for i in 0..node.num_records() {
-                        let record = node
-                            .record(i)
-                            .ok_or_else(|| anyhow!("missing index record {i} in node {node_num}"))?;
+                        let record = node.record(i).ok_or_else(|| {
+                            anyhow!("missing index record {i} in node {node_num}")
+                        })?;
                         let (key, key_size) = parse_key(record)?;
                         match compare_keys(&key, target, case_sensitive) {
                             Ordering::Less | Ordering::Equal => {
@@ -108,9 +106,8 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
                         // Target is smaller than every key; pick the
                         // leftmost child.
                         None => {
-                            let first = node
-                                .record(0)
-                                .ok_or_else(|| anyhow!("empty index node"))?;
+                            let first =
+                                node.record(0).ok_or_else(|| anyhow!("empty index node"))?;
                             let (_, key_size) = parse_key(first)?;
                             let bytes = first
                                 .get(key_size..key_size + 4)
@@ -126,10 +123,7 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
                             .record(i)
                             .ok_or_else(|| anyhow!("missing leaf record"))?;
                         let (key, _) = parse_key(record)?;
-                        if !matches!(
-                            compare_keys(&key, target, case_sensitive),
-                            Ordering::Less
-                        ) {
+                        if !matches!(compare_keys(&key, target, case_sensitive), Ordering::Less) {
                             return Ok((node_num, i));
                         }
                     }
@@ -155,7 +149,9 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
         if idx >= node.num_records() {
             return Ok(None);
         }
-        let record = node.record(idx).ok_or_else(|| anyhow!("missing leaf record"))?;
+        let record = node
+            .record(idx)
+            .ok_or_else(|| anyhow!("missing leaf record"))?;
         let (key, key_size) = parse_key(record)?;
         if compare_keys(&key, target, case_sensitive) != Ordering::Equal {
             return Ok(None);
@@ -201,7 +197,7 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
 
     fn read_catalog_node(&mut self, node_num: u32) -> Result<super::btree::Node> {
         let node_size = self.catalog_header.node_size;
-        let fork = self.volume_header.catalog_file.clone();
+        let fork = self.volume_header.catalog_file;
         let block_size = self.volume_header.block_size;
         let mut reader = ForkReader::new(&mut self.source, self.volume_offset, block_size, fork);
         read_node(&mut reader, node_num, node_size)
@@ -210,18 +206,12 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
     /// Resolve a POSIX-style path to the final catalog record.
     /// Returns `(cnid, record)`. `"/"` resolves to the root folder.
     fn resolve_path(&mut self, path: &str) -> Result<(HfsCatalogNodeID, CatalogRecord)> {
-        let components: Vec<&str> = path
-            .split('/')
-            .filter(|c| !c.is_empty())
-            .collect();
+        let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
 
         if components.is_empty() {
             // Root folder: look up its real record so callers get
             // accurate valence / dates instead of a synthesized stub.
-            let label = self
-                .volume_label
-                .clone()
-                .unwrap_or_default();
+            let label = self.volume_label.clone().unwrap_or_default();
             let key = CatalogKey {
                 parent_id: super::types::ROOT_PARENT_ID,
                 name_utf16: label.encode_utf16().collect(),
@@ -241,16 +231,12 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
                 .ok_or_else(|| anyhow!("path component not found: {name:?}"))?;
             match (&rec, i == last_idx) {
                 (CatalogRecord::Folder(f), false) => current_cnid = f.folder_id,
-                (CatalogRecord::Folder(f), true) => {
-                    return Ok((f.folder_id, rec))
-                }
+                (CatalogRecord::Folder(f), true) => return Ok((f.folder_id, rec)),
                 (CatalogRecord::File(f), true) => return Ok((f.file_id, rec)),
                 (CatalogRecord::File(_), false) => {
                     bail!("path component {name:?} is a file but not the last component")
                 }
-                _ => bail!(
-                    "unexpected catalog record while resolving {name:?}: {rec:?}"
-                ),
+                _ => bail!("unexpected catalog record while resolving {name:?}: {rec:?}"),
             }
         }
         unreachable!("path resolution should have returned in the loop")
@@ -323,12 +309,7 @@ impl<S: Read + Seek + Send> MacFilesystem for Hfsplus<S> {
         Ok(record_to_stat(name, &rec))
     }
 
-    fn read_file_range(
-        &mut self,
-        path: &str,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> Result<usize> {
+    fn read_file_range(&mut self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let (_cnid, rec) = self.resolve_path(path)?;
         let file = match rec {
             CatalogRecord::File(f) => f,

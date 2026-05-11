@@ -97,10 +97,8 @@ fn try_gpt<S: BlockSource>(source: &mut S) -> anyhow::Result<Option<Vec<Partitio
     let num_entries = cursor.read_u32::<LittleEndian>()? as usize;
     let entry_size = cursor.read_u32::<LittleEndian>()? as usize;
 
-    if entry_size < 128 || entry_size > 4096 || num_entries > 1024 {
-        bail!(
-            "GPT header looks corrupt: entry_size={entry_size}, num_entries={num_entries}"
-        );
+    if !(128..=4096).contains(&entry_size) || num_entries > 1024 {
+        bail!("GPT header looks corrupt: entry_size={entry_size}, num_entries={num_entries}");
     }
 
     source.seek(SeekFrom::Start(part_entry_lba * SECTOR_SIZE))?;
@@ -154,11 +152,22 @@ fn format_mixed_endian_guid(b: &[u8]) -> String {
          {:02X}{:02X}-\
          {:02X}{:02X}-\
          {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-        b[3], b[2], b[1], b[0],
-        b[5], b[4],
-        b[7], b[6],
-        b[8], b[9],
-        b[10], b[11], b[12], b[13], b[14], b[15],
+        b[3],
+        b[2],
+        b[1],
+        b[0],
+        b[5],
+        b[4],
+        b[7],
+        b[6],
+        b[8],
+        b[9],
+        b[10],
+        b[11],
+        b[12],
+        b[13],
+        b[14],
+        b[15],
     )
 }
 
@@ -288,9 +297,9 @@ mod tests {
         // Canonical: 48465300-0000-11AA-AA11-00306543ECAC
         let raw = [
             0x00, 0x53, 0x46, 0x48, // 48465300 (LE: first 4 bytes reversed)
-            0x00, 0x00,             // 0000
-            0xAA, 0x11,             // 11AA (LE: 2 bytes reversed)
-            0xAA, 0x11,             // AA11 (BE)
+            0x00, 0x00, // 0000
+            0xAA, 0x11, // 11AA (LE: 2 bytes reversed)
+            0xAA, 0x11, // AA11 (BE)
             0x00, 0x30, 0x65, 0x43, 0xEC, 0xAC, // 00306543ECAC (BE)
         ];
         assert_eq!(format_mixed_endian_guid(&raw), APPLE_HFS_PLUS_GUID);
@@ -316,11 +325,8 @@ mod tests {
         let entry = &mut disk[(2 * SECTOR_SIZE) as usize..(2 * SECTOR_SIZE) as usize + 128];
         // Type GUID raw bytes (Apple HFS+):
         entry[0..16].copy_from_slice(&[
-            0x00, 0x53, 0x46, 0x48,
-            0x00, 0x00,
-            0xAA, 0x11,
-            0xAA, 0x11,
-            0x00, 0x30, 0x65, 0x43, 0xEC, 0xAC,
+            0x00, 0x53, 0x46, 0x48, 0x00, 0x00, 0xAA, 0x11, 0xAA, 0x11, 0x00, 0x30, 0x65, 0x43,
+            0xEC, 0xAC,
         ]);
         // start LBA = 40, end LBA = 99 (inclusive)
         entry[32..40].copy_from_slice(&40u64.to_le_bytes());
