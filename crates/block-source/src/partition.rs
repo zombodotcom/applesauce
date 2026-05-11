@@ -256,7 +256,7 @@ fn read_exact_or_short<S: Read>(source: &mut S, buf: &mut [u8]) -> io::Result<us
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Seek};
 
     struct VecSource(Cursor<Vec<u8>>);
     impl Read for VecSource {

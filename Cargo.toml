@@ -4,6 +4,7 @@ members = [
     "crates/block-source",
     "crates/fs-core",
     "crates/winfsp-bridge",
+    "apps/applesauce-cat",
     "apps/applesauce-gui",
     "apps/applesauce-parts",
 ]

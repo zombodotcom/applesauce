@@ -1,0 +1,17 @@
+[package]
+name = "applesauce-cat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "HFS+ file lister / extractor — week-2 end-to-end smoke test"
+
+[[bin]]
+name = "applesauce-cat"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+block-source = { path = "../../crates/block-source" }
+fs-core = { path = "../../crates/fs-core" }

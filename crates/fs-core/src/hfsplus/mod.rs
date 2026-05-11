@@ -16,11 +16,14 @@
 //! Every multi-byte integer is big-endian.
 
 pub mod btree;
+pub mod catalog;
+pub mod filesystem;
 pub mod fork;
 pub mod fork_reader;
 pub mod types;
 pub mod volume;
 
+pub use filesystem::Hfsplus;
 pub use fork::{HFSPlusExtentDescriptor, HFSPlusForkData};
 pub use types::{HfsCatalogNodeID, HFSPLUS_SIGNATURE, HFSX_SIGNATURE};
 pub use volume::HFSPlusVolumeHeader;
