@@ -1,13 +1,18 @@
-//! applesauce-cat — exercise the HFS+ reader against a disk image.
+//! applesauce-cat — exercise the HFS+ reader against a disk image or
+//! a physical Mac drive plugged into Windows.
 //!
 //! Usage:
-//!   applesauce-cat <image>                       — show volume info
-//!   applesauce-cat <image> ls [path]             — list a directory
-//!   applesauce-cat <image> cat <path>            — dump a file to stdout
+//!   applesauce-cat <image>                          — volume info
+//!   applesauce-cat <image> ls [path]                — list a directory
+//!   applesauce-cat <image> cat <path>               — dump a file
 //!
-//! If the image contains a partition table, the first Mac-typed
-//! volume is auto-selected. If the image is a bare HFS+ volume
-//! (no partition table), it's used directly.
+//!   applesauce-cat --disk N                         — volume info
+//!   applesauce-cat --disk N ls [path]               — list a directory
+//!   applesauce-cat --disk N cat <path>              — dump a file
+//!
+//! If the source contains a partition table, the first Mac-typed
+//! volume is auto-selected. If there's no partition table, the source
+//! is treated as a bare HFS+ volume.
 
 use std::env;
 use std::io::Write;
@@ -37,19 +42,47 @@ fn run(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Source selection: --disk N | <image-path>
+    if args[0] == "--disk" {
+        #[cfg(windows)]
+        {
+            let n: u32 = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("--disk requires a drive number"))?
+                .parse()?;
+            let command = args.get(2).map(|s| s.as_str()).unwrap_or("info");
+            let arg = args.get(3);
+            let source = block_source::physical::PhysicalDisk::open(n)?;
+            let (volume_offset, mut fs) = open_first_hfsplus(source)?;
+            return dispatch(command, arg, &mut fs, volume_offset);
+        }
+        #[cfg(not(windows))]
+        {
+            anyhow::bail!("--disk is Windows-only");
+        }
+    }
+
     let image_path = &args[0];
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("info");
     let arg = args.get(2);
 
     let source = ImageFile::open(image_path)?;
     let (volume_offset, mut fs) = open_first_hfsplus(source)?;
+    dispatch(command, arg, &mut fs, volume_offset)
+}
 
+fn dispatch<S: BlockSource + 'static>(
+    command: &str,
+    arg: Option<&String>,
+    fs: &mut Hfsplus<Window<S>>,
+    volume_offset: u64,
+) -> anyhow::Result<()> {
     match command {
-        "info" => cmd_info(&fs, volume_offset),
-        "ls" => cmd_ls(&mut fs, arg.map(|s| s.as_str()).unwrap_or("/")),
+        "info" => cmd_info(fs, volume_offset),
+        "ls" => cmd_ls(fs, arg.map(|s| s.as_str()).unwrap_or("/")),
         "cat" => {
             let path = arg.ok_or_else(|| anyhow::anyhow!("cat needs a path"))?;
-            cmd_cat(&mut fs, path)
+            cmd_cat(fs, path)
         }
         other => anyhow::bail!("unknown subcommand {other:?}"),
     }
@@ -60,9 +93,10 @@ fn print_usage() {
         "applesauce-cat {}\n\
          \n\
          USAGE:\n  \
-           applesauce-cat <image>                 # volume info\n  \
-           applesauce-cat <image> ls [path]       # list directory (default: /)\n  \
-           applesauce-cat <image> cat <path>      # dump file to stdout",
+           applesauce-cat <image>                   # volume info\n  \
+           applesauce-cat <image> ls [path]         # list directory (default: /)\n  \
+           applesauce-cat <image> cat <path>        # dump file to stdout\n  \
+           applesauce-cat --disk N [...]            # read \\\\.\\PhysicalDriveN (Admin)",
         env!("CARGO_PKG_VERSION"),
     );
 }
@@ -70,11 +104,10 @@ fn print_usage() {
 /// Open `source`, find the first Mac-typed partition (or treat the
 /// whole source as a volume if there's no partition table), and hand
 /// back a windowed `Hfsplus`. The reported `volume_offset` is the byte
-/// offset of the chosen volume within `source` (always 0 inside the
-/// returned Window, but useful for diagnostics).
-fn open_first_hfsplus(
-    mut source: ImageFile,
-) -> anyhow::Result<(u64, Hfsplus<Window<ImageFile>>)> {
+/// offset of the chosen volume within `source`.
+fn open_first_hfsplus<S: BlockSource + 'static>(
+    mut source: S,
+) -> anyhow::Result<(u64, Hfsplus<Window<S>>)> {
     let parts = partition::probe(&mut source)?;
 
     let chosen: Option<Partition> = parts
@@ -86,7 +119,7 @@ fn open_first_hfsplus(
     let (start, length) = match chosen {
         Some(p) => (p.start_byte, p.length_bytes),
         None => {
-            // Treat the source as a bare HFS+ volume.
+            // No partition table — treat the source as a bare HFS+ volume.
             let len = source.len_bytes().ok_or_else(|| {
                 anyhow::anyhow!("source has no known length and no partition table")
             })?;
@@ -99,7 +132,7 @@ fn open_first_hfsplus(
     Ok((start, fs))
 }
 
-fn cmd_info(fs: &Hfsplus<Window<ImageFile>>, volume_offset: u64) -> anyhow::Result<()> {
+fn cmd_info<S: BlockSource>(fs: &Hfsplus<Window<S>>, volume_offset: u64) -> anyhow::Result<()> {
     println!("volume offset: {volume_offset} bytes");
     match fs.volume_label() {
         Some(label) => println!("volume label:  {label}"),
