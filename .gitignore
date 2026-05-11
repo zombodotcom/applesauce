@@ -9,3 +9,7 @@ Cargo.lock.bak
 .vscode/
 .idea/
 *.swp
+
+# Release staging
+/stage/
+/applesauce-*.zip

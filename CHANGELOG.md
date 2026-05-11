@@ -7,39 +7,50 @@ API and on-disk-format surface may shift between minor versions.
 
 ## [Unreleased]
 
-### Added
-- WinFsp bridge: `winfsp_bridge::Bridge` adapts a
-  `fs_core::MacFilesystem` to a WinFsp `FileSystemContext`, exposing
-  the volume as a Windows drive letter. Read-only — `read_only_volume`
-  set on the WinFsp volume params, no `create`/`write`/`delete`
-  surfaces. Serializes calls via `Arc<Mutex<dyn MacFilesystem>>` since
-  our reader is single-Seek.
-- `applesauce-mount` CLI (Windows-only): `--disk N <letter>` or
-  `<image> <letter>`. Ctrl-C unmounts.
-- `winfsp-bridge` crate gates its WinFsp deps behind a `mount` feature
-  (off by default) so `cargo check` from the root keeps working
-  without WinFsp installed.
-- `default-members` in workspace `Cargo.toml` excludes
-  `applesauce-mount` so `cargo build` from the root doesn't pull
-  WinFsp; explicit `-p applesauce-mount` opts in.
-- Release workflow installs LLVM + WinFsp on the runner, builds all
-  binaries, and drafts a GitHub Release with a zipped artifact.
+## [0.1.0-pre.6] — 2026-05-11
 
-### Removed
-- GitHub Actions CI workflow. Running `cargo fmt --check`, `cargo
-  clippy`, and `cargo test` locally before commit is enough for this
-  size of project.
+### Added
+- **HFS+ extents-overflow B-tree.** Catalog file records carry 8 inline
+  extents; anything beyond that lived in the overflow B-tree we
+  hadn't read yet. `crates/fs-core/src/hfsplus/extents.rs`
+  parses overflow keys / records and exposes
+  `ExtentsBTree::resolve_full_extents`, which Hfsplus opens at
+  startup and consults on `read_file_range` whenever
+  `data_fork.is_fully_inline()` is false. Real Mac drives with
+  fragmented files (system files, large packages) now read past the
+  8-extent boundary instead of erroring.
+- **`ForkReader::with_extents`.** Takes a fully-resolved
+  `Vec<HFSPlusExtentDescriptor>` so the reader doesn't need to know
+  whether the data came from inline or overflow extents.
+  `ForkReader::from_fork` stays as the inline-only convenience for
+  the four HFS+ special files.
+- **WinFsp bridge.** `winfsp_bridge::Bridge` adapts a
+  `fs_core::MacFilesystem` to a WinFsp `FileSystemContext`. Read-only
+  (`read_only_volume` set on `VolumeParams`; no
+  `create`/`write`/`delete` surfaces). Serializes calls via
+  `Arc<Mutex<dyn MacFilesystem>>` since our reader is single-Seek.
+  Gated behind the `mount` Cargo feature so the rest of the
+  workspace builds without WinFsp installed.
+- **`applesauce-mount` CLI** (Windows-only): `--disk N <letter>` or
+  `<image> <letter>`. Ctrl-C unmounts. `winfsp_build` build script
+  handles the WinFsp delay-load wiring so the binary loads without
+  WinFsp's bin dir on `PATH`.
+- **`applesauce-gui`**: real scan / mount / unmount UI. Scans
+  physical disks, lists Mac-typed partitions, lets you pick a free
+  drive letter and mount via the bridge. Background threads for scan
+  and mount so the UI never freezes. Warns when not elevated.
+- **`default-members`** excludes `applesauce-mount` and
+  `applesauce-gui`, so `cargo build` from the root works without
+  WinFsp + LLVM. Build them explicitly with `cargo build -p
+  applesauce-mount` / `-p applesauce-gui`.
 
 ### Verified
-- `applesauce-cat --disk 4` reads a live Mac OS X 10.11.6 (El Capitan)
-  HFS+ system volume end-to-end: GPT partition probe → volume header
-  → catalog B-tree → fork reader → file content
-  (e.g. `SystemVersion.plist`).
-- `cargo check` on the default workspace (no WinFsp) is clean.
-
-### Pending
-- End-to-end mount test on a real Mac drive (requires installing
-  WinFsp + LLVM locally; CI will validate the build path).
+- `applesauce-cat --disk N` reads a live Mac OS X 10.11.6 HFS+ system
+  volume end-to-end (GPT probe → volume header → catalog → fork
+  reader → file content).
+- 29 unit tests pass across the workspace (`cargo test`).
+- `cargo build --release` (default + WinFsp lanes) both produce
+  stripped release binaries.
 
 ## [0.1.0-pre.5] — 2026-05-11
 
@@ -83,7 +94,8 @@ API and on-disk-format surface may shift between minor versions.
   plus `applesauce-gui` app.
 - Dual MIT / Apache-2.0 license.
 
-[Unreleased]: https://github.com/zombodotcom/applesauce/compare/v0.1.0-pre.5...HEAD
+[Unreleased]: https://github.com/zombodotcom/applesauce/compare/v0.1.0-pre.6...HEAD
+[0.1.0-pre.6]: https://github.com/zombodotcom/applesauce/compare/v0.1.0-pre.5...v0.1.0-pre.6
 [0.1.0-pre.5]: https://github.com/zombodotcom/applesauce/compare/v0.1.0-pre.4...v0.1.0-pre.5
 [0.1.0-pre.4]: https://github.com/zombodotcom/applesauce/compare/v0.1.0-pre.3...v0.1.0-pre.4
 [0.1.0-pre.3]: https://github.com/zombodotcom/applesauce/compare/v0.1.0-pre.2...v0.1.0-pre.3
