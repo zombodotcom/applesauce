@@ -22,10 +22,13 @@ API and on-disk-format surface may shift between minor versions.
 - `default-members` in workspace `Cargo.toml` excludes
   `applesauce-mount` so `cargo build` from the root doesn't pull
   WinFsp; explicit `-p applesauce-mount` opts in.
-- CI: split into two jobs — `check` (no WinFsp) and `mount` (installs
-  LLVM + WinFsp, builds `applesauce-mount`).
 - Release workflow installs LLVM + WinFsp on the runner, builds all
   binaries, and drafts a GitHub Release with a zipped artifact.
+
+### Removed
+- GitHub Actions CI workflow. Running `cargo fmt --check`, `cargo
+  clippy`, and `cargo test` locally before commit is enough for this
+  size of project.
 
 ### Verified
 - `applesauce-cat --disk 4` reads a live Mac OS X 10.11.6 (El Capitan)
