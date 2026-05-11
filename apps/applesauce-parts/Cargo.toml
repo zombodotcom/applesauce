@@ -1,0 +1,16 @@
+[package]
+name = "applesauce-parts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Partition lister for applesauce — points at a disk or image and prints what's on it"
+
+[[bin]]
+name = "applesauce-parts"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+block-source = { path = "../../crates/block-source" }

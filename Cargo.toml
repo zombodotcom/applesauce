@@ -5,6 +5,7 @@ members = [
     "crates/fs-core",
     "crates/winfsp-bridge",
     "apps/applesauce-gui",
+    "apps/applesauce-parts",
 ]
 
 [workspace.package]

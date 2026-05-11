@@ -9,6 +9,7 @@
 
 pub mod image;
 pub mod partition;
+pub mod window;
 
 #[cfg(windows)]
 pub mod physical;
