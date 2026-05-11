@@ -10,7 +10,7 @@ use crate::{DirEntry, MacFilesystem, Stat};
 
 use super::btree::{read_btree_header, read_node, BTreeHeaderRecord, NodeKind};
 use super::catalog::{compare_keys, parse_key, parse_record_data, CatalogKey, CatalogRecord};
-use super::fork::HFSPlusForkData;
+use super::extents::{ExtentsBTree, FORK_TYPE_DATA};
 use super::fork_reader::ForkReader;
 use super::types::{HfsCatalogNodeID, ROOT_FOLDER_ID};
 use super::volume::HFSPlusVolumeHeader;
@@ -21,6 +21,7 @@ pub struct Hfsplus<S> {
     volume_offset: u64,
     volume_header: HFSPlusVolumeHeader,
     catalog_header: BTreeHeaderRecord,
+    extents_btree: ExtentsBTree,
     volume_label: Option<String>,
 }
 
@@ -33,7 +34,7 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
         let volume_header = HFSPlusVolumeHeader::read(&mut source)?;
 
         let catalog_header = {
-            let mut catalog_reader = ForkReader::new(
+            let mut catalog_reader = ForkReader::from_fork(
                 &mut source,
                 volume_offset,
                 volume_header.block_size,
@@ -43,11 +44,19 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
             hdr
         };
 
+        let extents_btree = ExtentsBTree::open(
+            &mut source,
+            volume_offset,
+            volume_header.block_size,
+            volume_header.extents_file,
+        )?;
+
         let mut fs = Self {
             source,
             volume_offset,
             volume_header,
             catalog_header,
+            extents_btree,
             volume_label: None,
         };
         fs.volume_label = fs.read_volume_label().ok();
@@ -199,7 +208,8 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
         let node_size = self.catalog_header.node_size;
         let fork = self.volume_header.catalog_file;
         let block_size = self.volume_header.block_size;
-        let mut reader = ForkReader::new(&mut self.source, self.volume_offset, block_size, fork);
+        let mut reader =
+            ForkReader::from_fork(&mut self.source, self.volume_offset, block_size, fork);
         read_node(&mut reader, node_num, node_size)
     }
 
@@ -310,21 +320,41 @@ impl<S: Read + Seek + Send> MacFilesystem for Hfsplus<S> {
     }
 
     fn read_file_range(&mut self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let (_cnid, rec) = self.resolve_path(path)?;
+        let (cnid, rec) = self.resolve_path(path)?;
         let file = match rec {
             CatalogRecord::File(f) => f,
             _ => bail!("not a file: {path}"),
         };
-        let mut reader = ForkReader::new(
+        let block_size = self.volume_header.block_size;
+        let volume_offset = self.volume_offset;
+
+        // Fast path: the inline 8 extents cover the entire data fork.
+        // Slow path: consult the extents-overflow B-tree to build the
+        // full extent list before reading.
+        let extents = if file.data_fork.is_fully_inline() {
+            file.data_fork
+                .extents
+                .iter()
+                .copied()
+                .take_while(|e| !e.is_empty())
+                .collect()
+        } else {
+            self.extents_btree.resolve_full_extents(
+                &mut self.source,
+                volume_offset,
+                block_size,
+                cnid,
+                FORK_TYPE_DATA,
+                &file.data_fork,
+            )?
+        };
+
+        let mut reader = ForkReader::with_extents(
             &mut self.source,
-            self.volume_offset,
-            self.volume_header.block_size,
-            HFSPlusForkData {
-                logical_size: file.data_fork.logical_size,
-                clump_size: file.data_fork.clump_size,
-                total_blocks: file.data_fork.total_blocks,
-                extents: file.data_fork.extents,
-            },
+            volume_offset,
+            block_size,
+            extents,
+            file.data_fork.logical_size,
         );
         reader.seek(SeekFrom::Start(offset))?;
         let mut filled = 0;

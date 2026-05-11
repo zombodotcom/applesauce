@@ -17,6 +17,7 @@
 
 pub mod btree;
 pub mod catalog;
+pub mod extents;
 pub mod filesystem;
 pub mod fork;
 pub mod fork_reader;

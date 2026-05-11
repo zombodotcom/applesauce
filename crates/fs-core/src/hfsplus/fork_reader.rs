@@ -1,18 +1,19 @@
 //! Read a fork's logical bytes by resolving extents on demand.
 //!
-//! A `ForkReader` wraps a `HFSPlusForkData` plus the parent block
-//! source and presents the fork as a `Read + Seek`. Internally it
+//! A `ForkReader` wraps a list of extent descriptors plus the parent
+//! block source and presents the fork as a `Read + Seek`. Internally it
 //! maps the logical offset to (extent, in-extent offset) and reads
-//! the appropriate range from the underlying source.
+//! from the underlying source.
 //!
-//! For v0, only the eight inline extents are consulted. Files that
-//! spill into the extents overflow B-tree return ErrorKind::Other
-//! at the boundary — overflow handling lands together with the
-//! extents-overflow B-tree work.
+//! The reader doesn't know about the extents-overflow B-tree. Callers
+//! that need overflow support are expected to gather the full extent
+//! list (inline + overflow) and pass it to [`ForkReader::with_extents`].
+//! [`ForkReader::from_fork`] is the convenience for the special files
+//! (catalog, extents, attributes) which are guaranteed to fit inline.
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use super::fork::HFSPlusForkData;
+use super::fork::{HFSPlusExtentDescriptor, HFSPlusForkData};
 
 /// Reads a fork's logical content over an underlying block source.
 pub struct ForkReader<'a, S> {
@@ -21,52 +22,84 @@ pub struct ForkReader<'a, S> {
     volume_offset: u64,
     /// HFS+ allocation block size (from the volume header).
     block_size: u32,
-    fork: HFSPlusForkData,
+    extents: Vec<HFSPlusExtentDescriptor>,
+    logical_size: u64,
     pos: u64,
 }
 
 impl<'a, S: Read + Seek> ForkReader<'a, S> {
-    pub fn new(
+    /// Build a reader from an explicit extent list. Callers must pass
+    /// every extent backing the fork, in fork order (inline first, then
+    /// any extents-overflow records). Trailing empty descriptors are
+    /// dropped.
+    pub fn with_extents(
+        source: &'a mut S,
+        volume_offset: u64,
+        block_size: u32,
+        mut extents: Vec<HFSPlusExtentDescriptor>,
+        logical_size: u64,
+    ) -> Self {
+        while extents.last().is_some_and(|e| e.is_empty()) {
+            extents.pop();
+        }
+        Self {
+            source,
+            volume_offset,
+            block_size,
+            extents,
+            logical_size,
+            pos: 0,
+        }
+    }
+
+    /// Build a reader from a fork descriptor's inline extents only.
+    /// Use this for HFS+ special files (catalog / extents / attributes /
+    /// allocation) which the spec guarantees fit in the inline extent
+    /// list.
+    pub fn from_fork(
         source: &'a mut S,
         volume_offset: u64,
         block_size: u32,
         fork: HFSPlusForkData,
     ) -> Self {
-        Self {
+        let extents = fork
+            .extents
+            .iter()
+            .copied()
+            .take_while(|e| !e.is_empty())
+            .collect();
+        Self::with_extents(
             source,
             volume_offset,
             block_size,
-            fork,
-            pos: 0,
-        }
+            extents,
+            fork.logical_size,
+        )
     }
 
     /// Total logical size of the fork.
     pub fn len(&self) -> u64 {
-        self.fork.logical_size
+        self.logical_size
     }
 
     /// Whether the fork has zero logical bytes.
     pub fn is_empty(&self) -> bool {
-        self.fork.logical_size == 0
+        self.logical_size == 0
     }
 
     /// Translate a logical byte offset into a disk byte offset and the
     /// number of contiguous bytes available from there. Returns
     /// `Ok(None)` past EOF, and `Err` if the byte falls in an extent
-    /// not represented in the inline list.
+    /// not represented in the provided list (caller forgot overflow).
     fn resolve(&self, logical: u64) -> io::Result<Option<(u64, u64)>> {
-        if logical >= self.fork.logical_size {
+        if logical >= self.logical_size {
             return Ok(None);
         }
 
         let block_size = self.block_size as u64;
         let mut blocks_before: u64 = 0;
 
-        for extent in &self.fork.extents {
-            if extent.is_empty() {
-                break;
-            }
+        for extent in &self.extents {
             let extent_start_logical = blocks_before * block_size;
             let extent_len_bytes = extent.block_count as u64 * block_size;
             let extent_end_logical = extent_start_logical + extent_len_bytes;
@@ -77,7 +110,7 @@ impl<'a, S: Read + Seek> ForkReader<'a, S> {
                     self.volume_offset + extent.start_block as u64 * block_size + offset_in_extent;
                 let bytes_left_in_extent = extent_len_bytes - offset_in_extent;
                 // Don't return more than the logical size.
-                let bytes_to_eof = self.fork.logical_size - logical;
+                let bytes_to_eof = self.logical_size - logical;
                 let avail = bytes_left_in_extent.min(bytes_to_eof);
                 return Ok(Some((disk_offset, avail)));
             }
@@ -85,10 +118,10 @@ impl<'a, S: Read + Seek> ForkReader<'a, S> {
         }
 
         // Logical offset is within logical_size but not covered by the
-        // inline extents: must be in the extents overflow B-tree.
-        Err(io::Error::other(
-            "fork extent outside inline list (overflow B-tree not yet supported)",
-        ))
+        // provided extents: caller forgot to include overflow extents.
+        Err(io::Error::other(format!(
+            "fork extent list ends at block {blocks_before} but logical_size needs more"
+        )))
     }
 }
 
@@ -121,7 +154,7 @@ impl<'a, S: Read + Seek> Seek for ForkReader<'a, S> {
         let new_pos = match pos {
             SeekFrom::Start(o) => o as i64,
             SeekFrom::Current(o) => self.pos as i64 + o,
-            SeekFrom::End(o) => self.fork.logical_size as i64 + o,
+            SeekFrom::End(o) => self.logical_size as i64 + o,
         };
         if new_pos < 0 {
             return Err(io::Error::new(
@@ -162,17 +195,14 @@ mod tests {
 
     #[test]
     fn reads_single_extent() {
-        // Disk: 4 blocks of 16 bytes each, blocks 1..3 contain "hello world!!!" pattern
         let block_size = 16u32;
         let mut disk = vec![0u8; block_size as usize * 8];
-        // Put bytes starting at block 2 (offset 32)
         let payload = b"hello world data";
         disk[32..48].copy_from_slice(payload);
 
-        // Fork: extent at block 2, count 1, logical size 16
         let fork = fork_with(&[(2, 1)], 16);
         let mut src = Cursor::new(disk);
-        let mut reader = ForkReader::new(&mut src, 0, block_size, fork);
+        let mut reader = ForkReader::from_fork(&mut src, 0, block_size, fork);
 
         let mut out = vec![0u8; 16];
         reader.read_exact(&mut out).unwrap();
@@ -183,17 +213,14 @@ mod tests {
     fn reads_across_two_extents() {
         let block_size = 16u32;
         let mut disk = vec![0u8; block_size as usize * 16];
-        // Extent 1 at block 1: "AAAAAAAAAAAAAAAA"
         disk[16..32].copy_from_slice(&[b'A'; 16]);
-        // Extent 2 at block 5: "BBBBBBBBBBBBBBBB"
         disk[80..96].copy_from_slice(&[b'B'; 16]);
 
         let fork = fork_with(&[(1, 1), (5, 1)], 32);
         let mut src = Cursor::new(disk);
-        let mut reader = ForkReader::new(&mut src, 0, block_size, fork);
+        let mut reader = ForkReader::from_fork(&mut src, 0, block_size, fork);
 
         let mut out = [0u8; 32];
-        // Loop because each .read() returns only up to the end of one extent
         let mut total = 0;
         while total < 32 {
             let n = reader.read(&mut out[total..]).unwrap();
@@ -206,20 +233,18 @@ mod tests {
 
     #[test]
     fn respects_logical_size_smaller_than_extents() {
-        // Fork claims one block (16 bytes of disk space) but logical_size is 10.
         let block_size = 16u32;
         let mut disk = vec![0u8; 32];
         disk[16..32].copy_from_slice(b"0123456789ABCDEF");
 
         let fork = fork_with(&[(1, 1)], 10);
         let mut src = Cursor::new(disk);
-        let mut reader = ForkReader::new(&mut src, 0, block_size, fork);
+        let mut reader = ForkReader::from_fork(&mut src, 0, block_size, fork);
 
         let mut out = vec![0u8; 32];
         let n = reader.read(&mut out).unwrap();
         assert_eq!(n, 10);
         assert_eq!(&out[..n], b"0123456789");
-        // Next read returns EOF.
         assert_eq!(reader.read(&mut out).unwrap(), 0);
     }
 
@@ -232,7 +257,7 @@ mod tests {
 
         let fork = fork_with(&[(0, 2)], 32);
         let mut src = Cursor::new(disk);
-        let mut reader = ForkReader::new(&mut src, 0, block_size, fork);
+        let mut reader = ForkReader::from_fork(&mut src, 0, block_size, fork);
 
         reader.seek(SeekFrom::Start(16)).unwrap();
         let mut out = vec![0u8; 16];
@@ -242,17 +267,49 @@ mod tests {
 
     #[test]
     fn volume_offset_applied() {
-        // Fork resides inside a volume that starts at byte 100 of the disk.
         let block_size = 16u32;
         let mut disk = vec![0u8; 200];
         disk[100 + 16..100 + 32].copy_from_slice(b"payload at vol+1");
 
         let fork = fork_with(&[(1, 1)], 16);
         let mut src = Cursor::new(disk);
-        let mut reader = ForkReader::new(&mut src, 100, block_size, fork);
+        let mut reader = ForkReader::from_fork(&mut src, 100, block_size, fork);
 
         let mut out = vec![0u8; 16];
         reader.read_exact(&mut out).unwrap();
         assert_eq!(&out, b"payload at vol+1");
+    }
+
+    #[test]
+    fn with_extents_handles_more_than_eight() {
+        // Build a fork made of 10 contiguous extents to prove
+        // with_extents doesn't choke past the 8-inline limit.
+        let block_size = 16u32;
+        let mut disk = vec![0u8; block_size as usize * 20];
+        // Fill blocks 0..10 with a pattern: block i = byte i repeated.
+        for blk in 0..10 {
+            let off = blk * block_size as usize;
+            disk[off..off + 16].copy_from_slice(&[blk as u8; 16]);
+        }
+
+        let extents: Vec<HFSPlusExtentDescriptor> = (0..10u32)
+            .map(|i| HFSPlusExtentDescriptor {
+                start_block: i,
+                block_count: 1,
+            })
+            .collect();
+        let mut src = Cursor::new(disk);
+        let mut reader = ForkReader::with_extents(&mut src, 0, block_size, extents, 10 * 16);
+
+        let mut out = [0u8; 10 * 16];
+        let mut total = 0;
+        while total < out.len() {
+            let n = reader.read(&mut out[total..]).unwrap();
+            assert!(n > 0);
+            total += n;
+        }
+        for blk in 0..10 {
+            assert_eq!(&out[blk * 16..(blk + 1) * 16], &[blk as u8; 16]);
+        }
     }
 }
