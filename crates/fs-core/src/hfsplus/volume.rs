@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Result};
 use binrw::{BinRead, BinReaderExt};
 
 use super::fork::HFSPlusForkData;
-use super::types::{HFSPLUS_SIGNATURE, HFSX_SIGNATURE, VOLUME_HEADER_OFFSET};
+use super::types::{HFSPLUS_SIGNATURE, HFSX_SIGNATURE, HFS_SIGNATURE, VOLUME_HEADER_OFFSET};
 
 #[derive(BinRead, Debug, Clone)]
 #[brw(big)]
@@ -54,7 +54,14 @@ impl HFSPlusVolumeHeader {
     /// Read and validate the volume header from a `Read + Seek` source
     /// positioned at the start of the HFS+ volume.
     pub fn read<S: Read + Seek>(source: &mut S) -> Result<Self> {
-        source.seek(SeekFrom::Start(VOLUME_HEADER_OFFSET))?;
+        Self::read_at(source, VOLUME_HEADER_OFFSET)
+    }
+
+    /// Read and validate the volume header at an absolute byte offset
+    /// in the source. Used when the volume sits inside an HFS wrapper
+    /// (see [`detect_hfs_wrapper`]).
+    pub fn read_at<S: Read + Seek>(source: &mut S, byte_offset: u64) -> Result<Self> {
+        source.seek(SeekFrom::Start(byte_offset))?;
         let header: HFSPlusVolumeHeader = source
             .read_be()
             .map_err(|e| anyhow!("decoding HFS+ volume header: {e}"))?;
@@ -92,6 +99,43 @@ impl HFSPlusVolumeHeader {
     pub fn is_case_sensitive(&self) -> bool {
         self.signature == HFSX_SIGNATURE
     }
+}
+
+/// Probe a source for an HFS-wrapped HFS+ volume (Mac OS 8.1–10.3
+/// formatted disks). Returns the byte offset of the embedded HFS+
+/// volume's start (relative to `volume_offset`), or `None` if the
+/// signature at `volume_offset + 1024` is not HFS classic.
+///
+/// Errors out if it _is_ HFS classic but doesn't embed an HFS+
+/// volume — pure classic HFS is not something this crate reads.
+pub fn detect_hfs_wrapper<S: Read + Seek>(
+    source: &mut S,
+    volume_offset: u64,
+) -> Result<Option<u64>> {
+    source.seek(SeekFrom::Start(volume_offset + VOLUME_HEADER_OFFSET))?;
+    let mut mdb = [0u8; 130];
+    source.read_exact(&mut mdb)?;
+
+    let sig = u16::from_be_bytes([mdb[0], mdb[1]]);
+    if sig != HFS_SIGNATURE {
+        return Ok(None);
+    }
+
+    let dr_al_blk_siz = u32::from_be_bytes([mdb[20], mdb[21], mdb[22], mdb[23]]);
+    let dr_al_bl_st = u16::from_be_bytes([mdb[28], mdb[29]]);
+    let dr_embed_sig = u16::from_be_bytes([mdb[124], mdb[125]]);
+    let embed_start = u16::from_be_bytes([mdb[126], mdb[127]]);
+
+    if dr_embed_sig != HFSPLUS_SIGNATURE && dr_embed_sig != HFSX_SIGNATURE {
+        bail!(
+            "classic HFS volume (signature 0x{HFS_SIGNATURE:04X}) with no embedded HFS+ \
+             (drEmbedSigWord = 0x{dr_embed_sig:04X}); pure HFS reading is not supported"
+        );
+    }
+
+    let embedded =
+        volume_offset + dr_al_bl_st as u64 * 512 + embed_start as u64 * dr_al_blk_siz as u64;
+    Ok(Some(embedded))
 }
 
 #[cfg(test)]

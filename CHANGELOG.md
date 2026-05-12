@@ -7,6 +7,33 @@ API and on-disk-format surface may shift between minor versions.
 
 ## [Unreleased]
 
+## [0.1.0-pre.7] — 2026-05-12
+
+### Added
+- **HFS-wrapped HFS+ support.** Mac OS 8.1–10.3 wrote HFS+ volumes
+  inside an HFS classic shell ("HFS+ wrapper"). `volume::detect_hfs_wrapper`
+  peeks at the MDB at byte 1024, and if it's a `BD` signature with a
+  `H+` drEmbedSigWord, computes the embedded HFS+ volume's offset from
+  `drAlBlSt * 512 + drEmbedExtent.startBlock * drAlBlkSiz`. `Hfsplus::open`
+  then proceeds against the embedded volume.
+- **`HFSPlusVolumeHeader::read_at`** lets the driver read a header at
+  an arbitrary byte offset rather than always at 1024.
+- **WinFsp auto-PATH.** `winfsp_bridge::mount` reads
+  `HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir` and prepends `bin` to
+  the process PATH before the first WinFsp call. WinFsp 2.x's SxS
+  install puts the delay-loaded `winfsp-x64.dll` somewhere the loader
+  doesn't probe by default; without this fixup the user had to add
+  `C:\Program Files (x86)\WinFsp\bin` to PATH manually.
+- **Clearer `winfsp_init` errors.** Surface the underlying Win32 /
+  NTSTATUS code so failures like "ERROR_DELAY_LOAD_FAILED (1285)" are
+  diagnosable without a debugger.
+
+### Verified
+- `applesauce-mount --disk N Z:` mounts a Mac OS X 10.4-era iBook G3
+  drive (APM partition map, HFS+-wrapped) end-to-end: `dir /b Z:\`
+  shows `/Applications`, `/Users/dave`, etc. Tested by browsing
+  `Z:\Applications` from `cmd.exe`.
+
 ## [0.1.0-pre.6] — 2026-05-11
 
 ### Added
@@ -94,7 +121,8 @@ API and on-disk-format surface may shift between minor versions.
   plus `applesauce-gui` app.
 - Dual MIT / Apache-2.0 license.
 
-[Unreleased]: https://github.com/zombodotcom/applesauce/compare/v0.1.0-pre.6...HEAD
+[Unreleased]: https://github.com/zombodotcom/applesauce/compare/v0.1.0-pre.7...HEAD
+[0.1.0-pre.7]: https://github.com/zombodotcom/applesauce/compare/v0.1.0-pre.6...v0.1.0-pre.7
 [0.1.0-pre.6]: https://github.com/zombodotcom/applesauce/compare/v0.1.0-pre.5...v0.1.0-pre.6
 [0.1.0-pre.5]: https://github.com/zombodotcom/applesauce/compare/v0.1.0-pre.4...v0.1.0-pre.5
 [0.1.0-pre.4]: https://github.com/zombodotcom/applesauce/compare/v0.1.0-pre.3...v0.1.0-pre.4

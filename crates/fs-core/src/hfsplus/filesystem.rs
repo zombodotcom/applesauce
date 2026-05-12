@@ -12,8 +12,8 @@ use super::btree::{read_btree_header, read_node, BTreeHeaderRecord, NodeKind};
 use super::catalog::{compare_keys, parse_key, parse_record_data, CatalogKey, CatalogRecord};
 use super::extents::{ExtentsBTree, FORK_TYPE_DATA};
 use super::fork_reader::ForkReader;
-use super::types::{HfsCatalogNodeID, ROOT_FOLDER_ID};
-use super::volume::HFSPlusVolumeHeader;
+use super::types::{HfsCatalogNodeID, ROOT_FOLDER_ID, VOLUME_HEADER_OFFSET};
+use super::volume::{self, HFSPlusVolumeHeader};
 
 /// Read-only HFS+ filesystem driver.
 pub struct Hfsplus<S> {
@@ -30,13 +30,24 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
     /// `source`. Reads and validates the volume header and catalog
     /// B-tree header eagerly; lazy work happens during list/read calls.
     pub fn open(mut source: S, volume_offset: u64) -> Result<Self> {
-        source.seek(SeekFrom::Start(volume_offset))?;
-        let volume_header = HFSPlusVolumeHeader::read(&mut source)?;
+        // Mac OS 8.1–10.3 wrote HFS+ volumes wrapped inside an HFS
+        // classic shell. The outer signature is 'BD'; the inner HFS+
+        // volume's offset lives in the MDB's drEmbedExtent. If that
+        // wrapper is present, shift our effective volume_offset to the
+        // embedded volume so everything downstream sees a normal HFS+
+        // layout.
+        let effective_offset = match volume::detect_hfs_wrapper(&mut source, volume_offset)? {
+            Some(embedded) => embedded,
+            None => volume_offset,
+        };
+
+        let volume_header =
+            HFSPlusVolumeHeader::read_at(&mut source, effective_offset + VOLUME_HEADER_OFFSET)?;
 
         let catalog_header = {
             let mut catalog_reader = ForkReader::from_fork(
                 &mut source,
-                volume_offset,
+                effective_offset,
                 volume_header.block_size,
                 volume_header.catalog_file,
             );
@@ -46,14 +57,14 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
 
         let extents_btree = ExtentsBTree::open(
             &mut source,
-            volume_offset,
+            effective_offset,
             volume_header.block_size,
             volume_header.extents_file,
         )?;
 
         let mut fs = Self {
             source,
-            volume_offset,
+            volume_offset: effective_offset,
             volume_header,
             catalog_header,
             extents_btree,

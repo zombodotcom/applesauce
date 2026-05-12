@@ -20,9 +20,13 @@ pub const ALLOCATION_FILE_ID: HfsCatalogNodeID = 6;
 pub const ATTRIBUTES_FILE_ID: HfsCatalogNodeID = 8;
 
 /// "H+" — case-insensitive HFS+ volume signature.
-pub const HFSPLUS_SIGNATURE: u16 = 0x482B; // big-endian 'H' 'P' -> wait, 'H'=0x48, '+'=0x2B
+pub const HFSPLUS_SIGNATURE: u16 = 0x482B;
 /// "HX" — case-sensitive HFSX volume signature.
 pub const HFSX_SIGNATURE: u16 = 0x4858;
+/// "BD" — classic HFS (Mac OS Standard) volume signature. We don't
+/// read pure HFS, but Mac OS 8.1–10.3 wrote HFS+ volumes _wrapped_
+/// inside an HFS shell, and the outer wrapper carries this signature.
+pub const HFS_SIGNATURE: u16 = 0x4244;
 
 /// HFS+ volume header is located at byte 1024 from the start of the volume.
 pub const VOLUME_HEADER_OFFSET: u64 = 1024;

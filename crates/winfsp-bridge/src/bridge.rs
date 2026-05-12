@@ -265,7 +265,19 @@ pub fn mount<FS>(fs: FS, total_bytes: u64, mountpoint: &str) -> anyhow::Result<M
 where
     FS: MacFilesystem + Send + 'static,
 {
-    let _init = winfsp::winfsp_init().context("winfsp_init failed")?;
+    // WinFsp 2.x ships in a Side-by-Side install directory. Without
+    // WinFsp's bin dir on PATH, the delay-loaded winfsp-x64.dll fails
+    // to resolve. The install dir lives in the registry; prepend it
+    // to PATH ourselves before the first call into the WinFsp crate.
+    prepend_winfsp_to_path();
+
+    let _init = winfsp::winfsp_init().map_err(|e| match e {
+        FspError::WIN32(c) => anyhow::anyhow!("winfsp_init failed: WIN32 error 0x{c:08X} ({c})"),
+        FspError::NTSTATUS(c) => {
+            anyhow::anyhow!("winfsp_init failed: NTSTATUS 0x{:08X}", c as u32)
+        }
+        other => anyhow::anyhow!("winfsp_init failed: {other:?}"),
+    })?;
 
     let mut params = VolumeParams::new();
     params
@@ -285,4 +297,59 @@ where
         .with_context(|| format!("mount {mountpoint} failed"))?;
     host.start().context("FileSystemHost::start failed")?;
     Ok(MountedHost { host })
+}
+
+/// Look up WinFsp's install dir in the registry and prepend its `bin`
+/// to PATH for this process. No-op if the registry key is missing —
+/// `winfsp_init` will then surface a clearer error.
+fn prepend_winfsp_to_path() {
+    use std::env;
+
+    // 32-bit view: SxsDir / InstallDir live under WOW6432Node on x64.
+    let install = [
+        "HKLM\\SOFTWARE\\WOW6432Node\\WinFsp",
+        "HKLM\\SOFTWARE\\WinFsp",
+    ]
+    .iter()
+    .find_map(|root| read_install_dir(root));
+
+    let Some(install) = install else {
+        return;
+    };
+
+    let bin = format!("{}\\bin", install.trim_end_matches('\\'));
+    let prior = env::var_os("PATH").unwrap_or_default();
+    let mut combined = std::ffi::OsString::from(&bin);
+    combined.push(";");
+    combined.push(&prior);
+    env::set_var("PATH", combined);
+}
+
+fn read_install_dir(root: &str) -> Option<String> {
+    use std::process::Command;
+    let out = Command::new("reg")
+        .args(["query", root, "/v", "InstallDir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("InstallDir") {
+            // "InstallDir    REG_SZ    C:\Program Files (x86)\WinFsp\"
+            let tail = rest.trim_start();
+            // Skip the type token.
+            let mut it = tail.splitn(2, char::is_whitespace);
+            let _ty = it.next();
+            if let Some(value) = it.next() {
+                let v = value.trim().to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
 }
