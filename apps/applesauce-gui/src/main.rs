@@ -9,12 +9,27 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() -> eframe::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Always log to a file alongside the binary so we can diagnose
+    // scan / mount issues without keeping a console open. Useful in
+    // release where windows_subsystem detaches stdout.
+    let log_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("applesauce.log")))
+        .unwrap_or_else(|| std::path::PathBuf::from("applesauce.log"));
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok();
+
+    let builder = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    );
+    match log_file {
+        Some(f) => builder.with_writer(std::sync::Mutex::new(f)).init(),
+        None => builder.init(),
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -150,51 +165,46 @@ mod app {
         }
 
         fn poll_scan(&mut self) {
-            let done = self
+            // try_recv consumes — drain it here, then drop the channel.
+            let result = self
                 .scanning
                 .as_ref()
-                .and_then(|(_, rx)| rx.try_recv().ok())
-                .is_some();
-            if done {
-                if let Some((handle, rx)) = self.scanning.take() {
-                    let res = rx.recv().ok();
+                .and_then(|(_, rx)| rx.try_recv().ok());
+            if let Some(res) = result {
+                if let Some((handle, _rx)) = self.scanning.take() {
                     let _ = handle.join();
-                    match res {
-                        Some(ScanResult::Done(v)) => {
-                            self.status = format!("Found {} Mac volume(s).", v.len());
-                            self.volumes = v;
-                        }
-                        None => self.status = "Scan thread vanished.".to_string(),
+                }
+                match res {
+                    ScanResult::Done(v) => {
+                        self.status = format!("Found {} Mac volume(s).", v.len());
+                        self.volumes = v;
                     }
                 }
             }
         }
 
         fn poll_mount(&mut self) {
-            let done = self
+            let result = self
                 .mounting
                 .as_ref()
-                .and_then(|(_, rx)| rx.try_recv().ok())
-                .is_some();
-            if done {
-                if let Some((handle, rx)) = self.mounting.take() {
-                    let res = rx.recv().ok();
+                .and_then(|(_, rx)| rx.try_recv().ok());
+            if let Some(res) = result {
+                if let Some((handle, _rx)) = self.mounting.take() {
                     let _ = handle.join();
-                    match res {
-                        Some(LaunchResult::Ok {
+                }
+                match res {
+                    LaunchResult::Ok {
+                        instance,
+                        mountpoint,
+                    } => {
+                        self.status = format!("Mounted on {mountpoint}.");
+                        self.active.push(ActiveMount {
                             instance,
                             mountpoint,
-                        }) => {
-                            self.status = format!("Mounted on {mountpoint}.");
-                            self.active.push(ActiveMount {
-                                instance,
-                                mountpoint,
-                            });
-                        }
-                        Some(LaunchResult::Err(e)) => {
-                            self.status = format!("Mount failed: {e}");
-                        }
-                        None => self.status = "Mount thread vanished.".to_string(),
+                        });
+                    }
+                    LaunchResult::Err(e) => {
+                        self.status = format!("Mount failed: {e}");
                     }
                 }
             }
@@ -465,10 +475,21 @@ mod app {
 
     fn scan_volumes() -> ScanResult {
         let mut out = Vec::new();
-        for disk in physical::enumerate() {
-            match scan_disk(disk) {
-                Ok(mut vols) => out.append(&mut vols),
-                Err(_) => continue,
+        let disks = physical::enumerate();
+        tracing::info!("scan: enumerated {} disk(s)", disks.len());
+        for disk in disks {
+            match scan_disk(disk.clone()) {
+                Ok(vols) => {
+                    tracing::info!(
+                        "scan: disk {} -> {} Mac volume(s)",
+                        disk.drive_number,
+                        vols.len()
+                    );
+                    out.extend(vols);
+                }
+                Err(e) => {
+                    tracing::warn!("scan: disk {} skipped: {:#}", disk.drive_number, e);
+                }
             }
         }
         ScanResult::Done(out)

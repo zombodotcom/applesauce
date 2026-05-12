@@ -13,17 +13,32 @@ API and on-disk-format surface may shift between minor versions.
 - **HFS-wrapped HFS+ support.** Mac OS 8.1–10.3 wrote HFS+ volumes
   inside an HFS classic shell ("HFS+ wrapper"). `volume::detect_hfs_wrapper`
   peeks at the MDB at byte 1024, and if it's a `BD` signature with a
-  `H+` drEmbedSigWord, computes the embedded HFS+ volume's offset from
-  `drAlBlSt * 512 + drEmbedExtent.startBlock * drAlBlkSiz`. `Hfsplus::open`
-  then proceeds against the embedded volume.
+  `H+` drEmbedSigWord, computes the embedded HFS+ volume's offset
+  from `drAlBlSt * 512 + drEmbedExtent.startBlock * drAlBlkSiz`.
+  `Hfsplus::open` then proceeds against the embedded volume —
+  transparent to callers.
 - **`HFSPlusVolumeHeader::read_at`** lets the driver read a header at
   an arbitrary byte offset rather than always at 1024.
+- **WinFsp.Launcher mount path.** New `applesauce-mount install` /
+  `uninstall` subcommands register/unregister the binary under
+  `HKLM\SOFTWARE\WOW6432Node\WinFsp\Services\applesauce`. After a
+  one-time elevated `install`, any unprivileged user can mount via
+  `launchctl-x64.exe start applesauce <id> <disk> <letter>`; the
+  launcher spawns us as SYSTEM and the drive letter is visible to
+  every Explorer session (no UAC "linked connections" split).
+- **GUI uses the launcher.** `applesauce` (the GUI binary) shells out
+  to `launchctl-x64.exe` for mount / unmount and to
+  `applesauce-mount.exe install` (via `Start-Process -Verb RunAs`)
+  for one-time service registration. GUI no longer depends on
+  `winfsp-bridge` at build time, so `cargo build` from root builds it
+  without WinFsp/LLVM. Only `applesauce-mount` keeps the WinFsp build
+  deps.
 - **WinFsp auto-PATH.** `winfsp_bridge::mount` reads
-  `HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir` and prepends `bin` to
-  the process PATH before the first WinFsp call. WinFsp 2.x's SxS
-  install puts the delay-loaded `winfsp-x64.dll` somewhere the loader
-  doesn't probe by default; without this fixup the user had to add
-  `C:\Program Files (x86)\WinFsp\bin` to PATH manually.
+  `HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir` and prepends `\bin`
+  to the process PATH before the first WinFsp call. WinFsp 2.x's SxS
+  install puts the delay-loaded `winfsp-x64.dll` somewhere the
+  loader doesn't probe by default; without this fixup the user had
+  to add `C:\Program Files (x86)\WinFsp\bin` to PATH manually.
 - **Clearer `winfsp_init` errors.** Surface the underlying Win32 /
   NTSTATUS code so failures like "ERROR_DELAY_LOAD_FAILED (1285)" are
   diagnosable without a debugger.
@@ -31,8 +46,12 @@ API and on-disk-format surface may shift between minor versions.
 ### Verified
 - `applesauce-mount --disk N Z:` mounts a Mac OS X 10.4-era iBook G3
   drive (APM partition map, HFS+-wrapped) end-to-end: `dir /b Z:\`
-  shows `/Applications`, `/Users/dave`, etc. Tested by browsing
-  `Z:\Applications` from `cmd.exe`.
+  shows `/Applications`, `/Users/dave`, etc.
+- `launchctl-x64 start applesauce mac4 4 Z:` from an unprivileged
+  shell mounts the same drive system-wide; the result shows in a
+  non-admin Explorer.
+- GUI: launches, scans, "Install service" pops UAC once, Mount
+  button works without further admin prompts.
 
 ## [0.1.0-pre.6] — 2026-05-11
 
