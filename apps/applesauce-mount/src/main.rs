@@ -2,10 +2,24 @@
 //! Windows drive letter. Read-only.
 //!
 //! Usage:
+//!   applesauce-mount install                     # register with WinFsp.Launcher
+//!   applesauce-mount uninstall                   # remove from WinFsp.Launcher
 //!   applesauce-mount --disk N <drive-letter>     # e.g. --disk 4 Z:
 //!   applesauce-mount <image>   <drive-letter>    # mount an image file
 //!
 //! Press Ctrl-C to unmount and exit.
+//!
+//! ## How "install" makes the drive visible to normal Explorer
+//!
+//! Raw physical-disk reads require Administrator on Windows; once
+//! mounted, the resulting drive letter is normally scoped to the
+//! elevated session (Windows' UAC "linked connections" split). To
+//! avoid making the user run Explorer elevated, `install` writes a
+//! one-time registry entry under `HKLM\SOFTWARE\WinFsp\Services\applesauce`
+//! that registers this binary with the WinFsp.Launcher SYSTEM
+//! service. From then on any unprivileged user can run
+//! `launchctl-x64.exe start applesauce <id> <disk> <letter>` and the
+//! launcher spawns us as SYSTEM — drive letter visible everywhere.
 
 #[cfg(not(windows))]
 fn main() {
@@ -44,13 +58,81 @@ mod win {
             return ExitCode::SUCCESS;
         }
 
-        match drive(&args) {
+        let result = match args[0].as_str() {
+            "install" => install_launcher_service(),
+            "uninstall" => uninstall_launcher_service(),
+            _ => drive(&args),
+        };
+        match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("applesauce-mount: {e:#}");
                 ExitCode::FAILURE
             }
         }
+    }
+
+    /// Registry path the WinFsp.Launcher service reads.
+    const REG_BASE: &str = r"HKLM\SOFTWARE\WinFsp\Services\applesauce";
+
+    fn install_launcher_service() -> anyhow::Result<()> {
+        let exe = std::env::current_exe()?;
+        let exe_str = exe.to_string_lossy().to_string();
+
+        // CommandLine template substituted by the launcher:
+        //   %1 = disk number, %2 = drive letter
+        // launchctl invocation will be:
+        //   launchctl-x64 start applesauce <instance-id> <disk-num> <letter>
+        let cmdline = "--disk %1 %2";
+
+        reg_set(REG_BASE, "Executable", RegType::Sz, &exe_str)?;
+        reg_set(REG_BASE, "CommandLine", RegType::Sz, cmdline)?;
+        reg_set(REG_BASE, "JobControl", RegType::Dword, "1")?;
+        // No Security key — defaults to allow LocalSystem + admins +
+        // built-in Users to invoke. That's what we want: any signed-in
+        // user can call launchctl-x64 start applesauce.
+        // (Default SDDL: D:P(A;;RPWPLC;;;WD) — World, Read/Write/Launch.)
+        reg_set(REG_BASE, "Security", RegType::Sz, "D:P(A;;RPWPLC;;;WD)")?;
+
+        eprintln!("Registered '{exe_str}' under HKLM\\SOFTWARE\\WinFsp\\Services\\applesauce.");
+        eprintln!("Anyone can now mount without admin:");
+        eprintln!(r#"  launchctl-x64.exe start applesauce <id> <disk> <letter>"#);
+        eprintln!(r#"e.g.  launchctl-x64.exe start applesauce mac4 4 Z:"#);
+        Ok(())
+    }
+
+    fn uninstall_launcher_service() -> anyhow::Result<()> {
+        let status = std::process::Command::new("reg")
+            .args(["delete", REG_BASE, "/f", "/reg:32"])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("reg delete failed (exit {})", status);
+        }
+        eprintln!("Unregistered applesauce from WinFsp.Launcher.");
+        Ok(())
+    }
+
+    enum RegType {
+        Sz,
+        Dword,
+    }
+
+    fn reg_set(key: &str, name: &str, ty: RegType, value: &str) -> anyhow::Result<()> {
+        let ty_arg = match ty {
+            RegType::Sz => "REG_SZ",
+            RegType::Dword => "REG_DWORD",
+        };
+        let status = std::process::Command::new("reg")
+            .args([
+                "add", key, "/v", name, "/t", ty_arg, "/d", value, "/f", "/reg:32",
+            ])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!(
+                "reg add {key}\\{name} failed (exit {status}) — run from an elevated shell"
+            );
+        }
+        Ok(())
     }
 
     fn drive(args: &[String]) -> anyhow::Result<()> {
@@ -97,10 +179,16 @@ mod win {
             "applesauce-mount {}\n\
              \n\
              USAGE:\n  \
-               applesauce-mount --disk N <drive-letter>   # e.g. --disk 4 Z:\n  \
+               applesauce-mount install                   # register with WinFsp.Launcher (admin, one-time)\n  \
+               applesauce-mount uninstall                 # unregister (admin)\n  \
+               applesauce-mount --disk N <drive-letter>   # direct mount: --disk 4 Z: (admin)\n  \
                applesauce-mount <image>   <drive-letter>  # mount image file\n\
              \n\
-             Requires WinFsp (https://winfsp.dev/) and Administrator for --disk.",
+             After `install`, any user can mount without admin via:\n  \
+               launchctl-x64.exe start applesauce <id> <disk-num> <letter>\n  \
+               launchctl-x64.exe stop  applesauce <id>\n\
+             \n\
+             Requires WinFsp (https://winfsp.dev/).",
             env!("CARGO_PKG_VERSION"),
         );
     }

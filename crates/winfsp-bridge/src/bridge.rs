@@ -289,6 +289,8 @@ where
         .sector_size(512)
         .sectors_per_allocation_unit(8)
         .max_component_length(255)
+        // 0 = no caching, every Explorer click hits the catalog. A
+        // bigger window helps responsiveness — 1s is conservative.
         .file_info_timeout(1000);
 
     let bridge = Bridge::new(fs, total_bytes);
