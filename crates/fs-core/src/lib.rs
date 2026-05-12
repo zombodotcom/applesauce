@@ -8,6 +8,7 @@
 
 pub mod apfs;
 pub mod hfsplus;
+pub mod pull;
 
 use std::time::SystemTime;
 

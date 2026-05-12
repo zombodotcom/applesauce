@@ -20,6 +20,7 @@ use std::env;
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use block_source::image::ImageFile;
@@ -27,6 +28,7 @@ use block_source::partition::{self, Partition, PartitionScheme};
 use block_source::window::Window;
 use block_source::BlockSource;
 use fs_core::hfsplus::Hfsplus;
+use fs_core::pull::{pull_tree, PullEvent, PullOptions};
 use fs_core::MacFilesystem;
 
 fn main() -> ExitCode {
@@ -117,10 +119,9 @@ fn print_usage() {
            applesauce-cat <image> pull <src> <dst-dir>  # recursive copy off the volume\n  \
            applesauce-cat --disk N [...]                # read \\\\.\\PhysicalDriveN (Admin)\n\
          \n\
-         pull copies a single file or a whole directory subtree from the\n\
-         HFS+ volume to <dst-dir> on the local filesystem. Filenames with\n\
-         characters illegal on Windows (`:`, `\\`, `<>|*?`, etc.) get those\n\
-         characters replaced with `_`.",
+         pull is restartable: it skips destination files whose size and\n\
+         mtime already match the source, and writes each in-flight file\n\
+         to <name>.applesauce-partial before renaming on success.",
         env!("CARGO_PKG_VERSION"),
     );
 }
@@ -209,50 +210,40 @@ fn cmd_cat<S: std::io::Read + std::io::Seek + Send>(
     Ok(())
 }
 
-#[derive(Default)]
-struct PullStats {
-    files: u64,
-    dirs: u64,
-    bytes: u64,
-    skipped: u64,
-    errors: u64,
-}
-
 fn cmd_pull<S: std::io::Read + std::io::Seek + Send>(
     fs: &mut Hfsplus<S>,
     src: &str,
     dst_dir: &Path,
 ) -> anyhow::Result<()> {
-    let st = fs.stat(src)?;
-
-    // dst_dir is treated as the *container*. If src is a directory
-    // named "Users", we copy into "<dst_dir>/Users/...". If src is a
-    // single file, we copy to "<dst_dir>/<filename>".
-    std::fs::create_dir_all(dst_dir)?;
-
     let start = Instant::now();
-    let mut stats = PullStats::default();
-    let mut buf = vec![0u8; 1024 * 1024];
+    let opts = PullOptions::default();
+    let cancel = AtomicBool::new(false);
 
-    let leaf_name = src
-        .rsplit('/')
-        .find(|s| !s.is_empty())
-        .unwrap_or("")
-        .to_string();
-    let safe_leaf = if leaf_name.is_empty() {
-        fs.volume_label().unwrap_or("root").to_string()
-    } else {
-        sanitize_name(&leaf_name)
+    let mut files_seen: u64 = 0;
+    let mut last_progress = Instant::now();
+    let mut on_event = |ev: PullEvent| match ev {
+        PullEvent::Error { src, message } => eprintln!("  ! {src}: {message}"),
+        PullEvent::SkippedPrivate { name, .. } => {
+            eprintln!("  - skipped private dir: {name}");
+        }
+        PullEvent::SkippedExisting { src, .. } => {
+            eprintln!("  = skip (match): {src}");
+        }
+        PullEvent::FinishedFile { bytes_written, .. } => {
+            files_seen += 1;
+            if last_progress.elapsed().as_millis() >= 250 {
+                last_progress = Instant::now();
+                eprint!(
+                    "  {} files done, last {} bytes\r",
+                    files_seen, bytes_written
+                );
+                let _ = std::io::stderr().flush();
+            }
+        }
+        _ => {}
     };
-    let dst_root = dst_dir.join(&safe_leaf);
 
-    if st.is_dir {
-        std::fs::create_dir_all(&dst_root)?;
-        stats.dirs += 1;
-        pull_dir(fs, src, &dst_root, &mut stats, &mut buf)?;
-    } else {
-        copy_file(fs, src, st.size_bytes, &dst_root, &mut stats, &mut buf)?;
-    }
+    let stats = pull_tree(fs, src, dst_dir, &opts, &cancel, &mut on_event)?;
 
     let elapsed = start.elapsed();
     let mb = stats.bytes as f64 / (1u64 << 20) as f64;
@@ -273,228 +264,4 @@ fn cmd_pull<S: std::io::Read + std::io::Seek + Send>(
         stats.errors
     );
     Ok(())
-}
-
-fn pull_dir<S: std::io::Read + std::io::Seek + Send>(
-    fs: &mut Hfsplus<S>,
-    src: &str,
-    dst: &Path,
-    stats: &mut PullStats,
-    buf: &mut [u8],
-) -> anyhow::Result<()> {
-    let entries = match fs.list_dir(src) {
-        Ok(v) => v,
-        Err(e) => {
-            stats.errors += 1;
-            eprintln!("  ! list_dir {src}: {e:#}");
-            return Ok(());
-        }
-    };
-
-    for e in entries {
-        // Skip the catalog's private-data directories — they hold
-        // implementation detail (hard-link inodes, etc.) and would
-        // create huge, mostly-useless folders on the destination.
-        if is_private(&e.name) {
-            stats.skipped += 1;
-            continue;
-        }
-
-        let safe = sanitize_name(&e.name);
-        let dst_path = dst.join(&safe);
-        let src_path = if src.ends_with('/') {
-            format!("{src}{}", e.name)
-        } else {
-            format!("{src}/{}", e.name)
-        };
-
-        if e.is_dir {
-            if let Err(err) = std::fs::create_dir_all(&dst_path) {
-                stats.errors += 1;
-                eprintln!("  ! mkdir {}: {err}", dst_path.display());
-                continue;
-            }
-            stats.dirs += 1;
-            pull_dir(fs, &src_path, &dst_path, stats, buf)?;
-        } else {
-            copy_file(fs, &src_path, e.size_bytes, &dst_path, stats, buf)?;
-        }
-    }
-    Ok(())
-}
-
-fn copy_file<S: std::io::Read + std::io::Seek + Send>(
-    fs: &mut Hfsplus<S>,
-    src: &str,
-    size: u64,
-    dst: &Path,
-    stats: &mut PullStats,
-    buf: &mut [u8],
-) -> anyhow::Result<()> {
-    let mut out = match std::fs::File::create(dst) {
-        Ok(f) => f,
-        Err(e) => {
-            stats.errors += 1;
-            eprintln!("  ! create {}: {e}", dst.display());
-            return Ok(());
-        }
-    };
-
-    let mut offset = 0u64;
-    while offset < size {
-        match fs.read_file_range(src, offset, buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if let Err(e) = out.write_all(&buf[..n]) {
-                    stats.errors += 1;
-                    eprintln!("  ! write {}: {e}", dst.display());
-                    return Ok(());
-                }
-                offset += n as u64;
-            }
-            Err(e) => {
-                stats.errors += 1;
-                eprintln!("  ! read {src}: {e:#}");
-                return Ok(());
-            }
-        }
-    }
-
-    if let Err(e) = out.flush() {
-        stats.errors += 1;
-        eprintln!("  ! flush {}: {e}", dst.display());
-        return Ok(());
-    }
-
-    stats.files += 1;
-    stats.bytes += offset;
-    if stats.files.is_multiple_of(50) {
-        eprint!(
-            "  {} files, {:.2} MiB\r",
-            stats.files,
-            stats.bytes as f64 / (1u64 << 20) as f64
-        );
-        let _ = std::io::stderr().flush();
-    }
-    Ok(())
-}
-
-/// Replace Windows-illegal filename characters with `_`. Returns at
-/// least one character; empty / dot-only names become `_`.
-fn sanitize_name(name: &str) -> String {
-    // 1. Replace Windows-illegal chars + control chars with `_`.
-    let mut escaped = String::with_capacity(name.len());
-    for c in name.chars() {
-        let safe = match c {
-            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
-            c if (c as u32) < 0x20 => '_',
-            c => c,
-        };
-        escaped.push(safe);
-    }
-
-    // 2. Windows silently strips trailing dots and spaces. Trim them
-    //    explicitly so the file lands where we expect.
-    let trimmed = escaped.trim_end_matches(['.', ' ']).to_string();
-
-    // 3. Empty or only-dots (".", "..") gets a single underscore.
-    if trimmed.is_empty() {
-        return "_".to_string();
-    }
-
-    // 4. If we stripped any trailing dot/space, signal that with a
-    //    suffix so the result is distinguishable from the original.
-    let body = if trimmed.len() < escaped.len() {
-        format!("{trimmed}_")
-    } else {
-        trimmed
-    };
-
-    // 5. Reserved DOS device names get a leading underscore so they
-    //    don't clash with the Windows namespace.
-    let stem = body.split('.').next().unwrap_or(&body).to_ascii_uppercase();
-    if matches!(
-        stem.as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    ) {
-        format!("_{body}")
-    } else {
-        body
-    }
-}
-
-/// HFS+ keeps internal bookkeeping in two specially-named folders at
-/// the volume root. Copying them would balloon the destination with
-/// hard-link inode shadows, and the names contain non-printable
-/// characters that confuse shells.
-fn is_private(name: &str) -> bool {
-    matches!(
-        name,
-        ".HFS+ Private Directory Data\u{0d}"
-            | "\u{0}\u{0}\u{0}\u{0}HFS+ Private Data"
-            // Also skip the catalog's display variants we surface as plain text.
-            | ".HFS+ Private Directory Data"
-            | "    HFS+ Private Data"
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sanitize_replaces_illegal_chars() {
-        assert_eq!(sanitize_name("hello"), "hello");
-        assert_eq!(sanitize_name("a:b"), "a_b");
-        assert_eq!(sanitize_name(r"a/b\c"), "a_b_c");
-        assert_eq!(sanitize_name("foo*"), "foo_");
-        assert_eq!(sanitize_name("good?"), "good_");
-    }
-
-    #[test]
-    fn sanitize_handles_trailing_dot_space() {
-        // Windows strips these silently and the file would land
-        // somewhere unexpected; replace with `_` to make it explicit.
-        let s = sanitize_name("foo.");
-        assert!(s.ends_with('_'));
-        let s = sanitize_name("bar ");
-        assert!(s.ends_with('_'));
-    }
-
-    #[test]
-    fn sanitize_escapes_reserved_dos_names() {
-        assert_eq!(sanitize_name("CON"), "_CON");
-        assert_eq!(sanitize_name("nul.txt"), "_nul.txt");
-        assert_eq!(sanitize_name("LPT3"), "_LPT3");
-        // case-insensitive
-        assert_eq!(sanitize_name("Aux"), "_Aux");
-    }
-
-    #[test]
-    fn sanitize_empty_or_dots() {
-        assert_eq!(sanitize_name(""), "_");
-        assert_eq!(sanitize_name("."), "_");
-        assert_eq!(sanitize_name(".."), "_");
-    }
 }
