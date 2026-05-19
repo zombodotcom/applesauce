@@ -1,19 +1,49 @@
 //! HFS+ filesystem driver: ties volume header + catalog B-tree + fork
 //! reader together into a `MacFilesystem` implementation.
+//!
+//! ## Caching
+//!
+//! Three caches sit in front of the disk:
+//!
+//! - **`path_cache`** maps a POSIX path → `(CNID, CatalogRecord)`.
+//!   Explorer calls `get_security_by_name`, then `open`, then
+//!   `get_file_info` ×N for the same path back-to-back; without this
+//!   cache each one re-descends the catalog B-tree once per path
+//!   component (a `/Users/dave/Documents/foo.txt` access = 4 descents
+//!   × ~12 catalog nodes = ~50 disk reads).
+//! - **`node_cache`** caches parsed catalog B-tree nodes by
+//!   `node_num`. The root + first-level index nodes are touched on
+//!   every descent, so this is the highest-hit cache in practice.
+//! - **`children_cache`** caches `list_children` results by parent
+//!   CNID. Explorer re-lists directories on sort, filter, and pane
+//!   switches.
+//!
+//! All caches are read-only volume safe: no invalidation is needed.
 
 use std::cmp::Ordering;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
+use quick_cache::sync::Cache;
 
 use crate::{DirEntry, MacFilesystem, Stat};
 
-use super::btree::{read_btree_header, read_node, BTreeHeaderRecord, NodeKind};
+use super::btree::{read_btree_header, read_node, BTreeHeaderRecord, Node, NodeKind};
 use super::catalog::{compare_keys, parse_key, parse_record_data, CatalogKey, CatalogRecord};
 use super::extents::{ExtentsBTree, FORK_TYPE_DATA};
 use super::fork_reader::ForkReader;
 use super::types::{HfsCatalogNodeID, ROOT_FOLDER_ID, VOLUME_HEADER_OFFSET};
 use super::volume::{self, HFSPlusVolumeHeader};
+
+/// Cache sizes chosen for typical Explorer-driven browsing:
+///   - 2048 unique paths covers a deep walk + thumbnail batch
+///   - 128 catalog nodes (~1 MiB at 8 KiB/node) holds the root +
+///     a couple of index layers plus recently-touched leaves
+///   - 256 directories covers anything you'd realistically open
+const PATH_CACHE_CAPACITY: usize = 2048;
+const NODE_CACHE_CAPACITY: usize = 128;
+const CHILDREN_CACHE_CAPACITY: usize = 256;
 
 /// Read-only HFS+ filesystem driver.
 pub struct Hfsplus<S> {
@@ -23,6 +53,9 @@ pub struct Hfsplus<S> {
     catalog_header: BTreeHeaderRecord,
     extents_btree: ExtentsBTree,
     volume_label: Option<String>,
+    path_cache: Cache<String, (HfsCatalogNodeID, CatalogRecord)>,
+    node_cache: Cache<u32, Arc<Node>>,
+    children_cache: Cache<HfsCatalogNodeID, Arc<Vec<(CatalogKey, CatalogRecord)>>>,
 }
 
 impl<S: Read + Seek + Send> Hfsplus<S> {
@@ -69,6 +102,9 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
             catalog_header,
             extents_btree,
             volume_label: None,
+            path_cache: Cache::new(PATH_CACHE_CAPACITY),
+            node_cache: Cache::new(NODE_CACHE_CAPACITY),
+            children_cache: Cache::new(CHILDREN_CACHE_CAPACITY),
         };
         fs.volume_label = fs.read_volume_label().ok();
         Ok(fs)
@@ -180,8 +216,22 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
         Ok(Some(parse_record_data(data)?))
     }
 
-    /// Collect all child folder/file records of `parent_cnid`.
+    /// Collect all child folder/file records of `parent_cnid`. Cached:
+    /// Explorer re-lists directories on every sort/filter/repaint.
     fn list_children(
+        &mut self,
+        parent_cnid: HfsCatalogNodeID,
+    ) -> Result<Arc<Vec<(CatalogKey, CatalogRecord)>>> {
+        if let Some(cached) = self.children_cache.get(&parent_cnid) {
+            return Ok(cached);
+        }
+        let v = self.list_children_uncached(parent_cnid)?;
+        let arc = Arc::new(v);
+        self.children_cache.insert(parent_cnid, arc.clone());
+        Ok(arc)
+    }
+
+    fn list_children_uncached(
         &mut self,
         parent_cnid: HfsCatalogNodeID,
     ) -> Result<Vec<(CatalogKey, CatalogRecord)>> {
@@ -215,18 +265,35 @@ impl<S: Read + Seek + Send> Hfsplus<S> {
         }
     }
 
-    fn read_catalog_node(&mut self, node_num: u32) -> Result<super::btree::Node> {
+    fn read_catalog_node(&mut self, node_num: u32) -> Result<Arc<Node>> {
+        if let Some(cached) = self.node_cache.get(&node_num) {
+            return Ok(cached);
+        }
         let node_size = self.catalog_header.node_size;
         let fork = self.volume_header.catalog_file;
         let block_size = self.volume_header.block_size;
-        let mut reader =
-            ForkReader::from_fork(&mut self.source, self.volume_offset, block_size, fork);
-        read_node(&mut reader, node_num, node_size)
+        let node = {
+            let mut reader =
+                ForkReader::from_fork(&mut self.source, self.volume_offset, block_size, fork);
+            read_node(&mut reader, node_num, node_size)?
+        };
+        let arc = Arc::new(node);
+        self.node_cache.insert(node_num, arc.clone());
+        Ok(arc)
     }
 
     /// Resolve a POSIX-style path to the final catalog record.
     /// Returns `(cnid, record)`. `"/"` resolves to the root folder.
     fn resolve_path(&mut self, path: &str) -> Result<(HfsCatalogNodeID, CatalogRecord)> {
+        if let Some(cached) = self.path_cache.get(path) {
+            return Ok(cached);
+        }
+        let result = self.resolve_path_uncached(path)?;
+        self.path_cache.insert(path.to_string(), result.clone());
+        Ok(result)
+    }
+
+    fn resolve_path_uncached(&mut self, path: &str) -> Result<(HfsCatalogNodeID, CatalogRecord)> {
         let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
 
         if components.is_empty() {
@@ -315,8 +382,8 @@ impl<S: Read + Seek + Send> MacFilesystem for Hfsplus<S> {
         }
         let children = self.list_children(cnid)?;
         Ok(children
-            .into_iter()
-            .map(|(key, rec)| record_to_stat(key.name(), &rec))
+            .iter()
+            .map(|(key, rec)| record_to_stat(key.name(), rec))
             .collect())
     }
 

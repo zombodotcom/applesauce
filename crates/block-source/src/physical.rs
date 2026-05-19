@@ -24,8 +24,11 @@ use windows::Win32::System::IO::DeviceIoControl;
 
 use crate::BlockSource;
 
-/// Read-ahead buffer size. Multiple of any common sector size (512 / 4096).
-const CACHE_SIZE: usize = 64 * 1024;
+/// Read-ahead buffer size. Sized to comfortably hold the HFS+ catalog
+/// B-tree root + first-level index nodes (8 KiB each) so back-to-back
+/// path resolutions don't re-issue physical reads. Multiple of all
+/// common sector sizes (512 / 4096).
+const CACHE_SIZE: usize = 1024 * 1024;
 
 /// Summary info about a physical disk discovered by [`enumerate`].
 #[derive(Debug, Clone)]

@@ -13,4 +13,7 @@ thiserror.workspace = true
 tracing.workspace = true
 binrw.workspace = true
 byteorder.workspace = true
+# Sharded interior-mutable cache. Lets Hfsplus serve cached results
+# from `&self` so we don't lock-contend a single Mutex<LruCache>.
+quick_cache = "0.6"
 block-source = { path = "../block-source" }

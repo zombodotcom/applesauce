@@ -104,6 +104,10 @@ fn dispatch<S: BlockSource + 'static>(
                 .ok_or_else(|| anyhow::anyhow!("pull needs a destination directory"))?;
             cmd_pull(fs, src, Path::new(dst))
         }
+        "bench" => {
+            let path = rest.first().copied().unwrap_or("/");
+            cmd_bench(fs, path)
+        }
         other => anyhow::bail!("unknown subcommand {other:?}"),
     }
 }
@@ -117,11 +121,16 @@ fn print_usage() {
            applesauce-cat <image> ls [path]             # list directory (default: /)\n  \
            applesauce-cat <image> cat <path>            # dump file to stdout\n  \
            applesauce-cat <image> pull <src> <dst-dir>  # recursive copy off the volume\n  \
+           applesauce-cat <image> bench [path]          # perf smoke test\n  \
            applesauce-cat --disk N [...]                # read \\\\.\\PhysicalDriveN (Admin)\n\
          \n\
          pull is restartable: it skips destination files whose size and\n\
          mtime already match the source, and writes each in-flight file\n\
-         to <name>.applesauce-partial before renaming on success.",
+         to <name>.applesauce-partial before renaming on success.\n\
+         \n\
+         bench measures the cost of metadata + read operations under a\n\
+         directory: cold + warm `stat` on each child, one `list_dir`,\n\
+         and a sequential read of the first regular file found.",
         env!("CARGO_PKG_VERSION"),
     );
 }
@@ -207,6 +216,120 @@ fn cmd_cat<S: std::io::Read + std::io::Seek + Send>(
         offset += n as u64;
     }
     stdout.flush()?;
+    Ok(())
+}
+
+/// Perf smoke test: enumerate `path` once (cold), then `stat` each
+/// child twice (cold + warm) and report median latencies, then do one
+/// `list_dir` warm and one 4 MiB sequential read on the first regular
+/// file. Lets us baseline cache wins between releases.
+fn cmd_bench<S: std::io::Read + std::io::Seek + Send>(
+    fs: &mut Hfsplus<S>,
+    path: &str,
+) -> anyhow::Result<()> {
+    use std::time::Instant;
+
+    // Cold list_dir.
+    let t0 = Instant::now();
+    let entries = fs.list_dir(path)?;
+    let cold_list_us = t0.elapsed().as_micros();
+    let n = entries.len();
+    println!(
+        "list_dir({path}) cold:    {} entries in {:.2} ms ({:.0} entries/ms)",
+        n,
+        cold_list_us as f64 / 1000.0,
+        n as f64 / (cold_list_us.max(1) as f64 / 1000.0),
+    );
+
+    // Warm list_dir — exercises children_cache.
+    let t0 = Instant::now();
+    let _ = fs.list_dir(path)?;
+    let warm_list_us = t0.elapsed().as_micros();
+    println!(
+        "list_dir({path}) warm:    {} entries in {:.2} ms (speedup {:.1}x)",
+        n,
+        warm_list_us as f64 / 1000.0,
+        cold_list_us as f64 / warm_list_us.max(1) as f64,
+    );
+
+    // Cold stat each child (different paths — exercises path resolution).
+    let mut cold_stats_us: Vec<u128> = Vec::with_capacity(n);
+    for e in &entries {
+        let child = if path == "/" {
+            format!("/{}", e.name)
+        } else {
+            format!("{}/{}", path, e.name)
+        };
+        let t0 = Instant::now();
+        let _ = fs.stat(&child);
+        cold_stats_us.push(t0.elapsed().as_micros());
+    }
+    if !cold_stats_us.is_empty() {
+        cold_stats_us.sort_unstable();
+        let median = cold_stats_us[cold_stats_us.len() / 2];
+        let total: u128 = cold_stats_us.iter().sum();
+        println!(
+            "stat (cold) over {n} children: median {median} µs, total {:.2} ms",
+            total as f64 / 1000.0,
+        );
+    }
+
+    // Warm stat (each path is now in path_cache).
+    let mut warm_stats_us: Vec<u128> = Vec::with_capacity(n);
+    for e in &entries {
+        let child = if path == "/" {
+            format!("/{}", e.name)
+        } else {
+            format!("{}/{}", path, e.name)
+        };
+        let t0 = Instant::now();
+        let _ = fs.stat(&child);
+        warm_stats_us.push(t0.elapsed().as_micros());
+    }
+    if !warm_stats_us.is_empty() {
+        warm_stats_us.sort_unstable();
+        let median = warm_stats_us[warm_stats_us.len() / 2];
+        let total: u128 = warm_stats_us.iter().sum();
+        println!(
+            "stat (warm) over {n} children: median {median} µs, total {:.2} ms",
+            total as f64 / 1000.0,
+        );
+    }
+
+    // Sequential read of the first regular file we find.
+    if let Some(file) = entries.iter().find(|e| !e.is_dir && e.size_bytes > 0) {
+        let target = if path == "/" {
+            format!("/{}", file.name)
+        } else {
+            format!("{}/{}", path, file.name)
+        };
+        let want = (4 * 1024 * 1024).min(file.size_bytes) as usize;
+        let mut buf = vec![0u8; 65_536];
+        let t0 = Instant::now();
+        let mut offset = 0u64;
+        let mut got = 0usize;
+        while got < want {
+            let n = fs.read_file_range(&target, offset, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            offset += n as u64;
+            got += n;
+        }
+        let elapsed = t0.elapsed();
+        let mib = got as f64 / (1024.0 * 1024.0);
+        let mibps = mib / elapsed.as_secs_f64().max(0.000_001);
+        println!(
+            "read({target}) {} bytes ({:.2} MiB) in {:.2} ms ({:.1} MiB/s)",
+            got,
+            mib,
+            elapsed.as_secs_f64() * 1000.0,
+            mibps,
+        );
+    } else {
+        println!("(no regular file in {path}, skipping read benchmark)");
+    }
+
     Ok(())
 }
 
