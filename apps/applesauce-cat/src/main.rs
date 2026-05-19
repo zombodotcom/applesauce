@@ -94,15 +94,21 @@ fn dispatch<S: BlockSource + 'static>(
             cmd_cat(fs, path)
         }
         "pull" => {
-            let src = rest
+            let skip_existing = rest.contains(&"--skip-existing");
+            let positional: Vec<&str> = rest
+                .iter()
+                .copied()
+                .filter(|a| !a.starts_with("--"))
+                .collect();
+            let src = positional
                 .first()
                 .copied()
                 .ok_or_else(|| anyhow::anyhow!("pull needs a source path"))?;
-            let dst = rest
+            let dst = positional
                 .get(1)
                 .copied()
                 .ok_or_else(|| anyhow::anyhow!("pull needs a destination directory"))?;
-            cmd_pull(fs, src, Path::new(dst))
+            cmd_pull(fs, src, Path::new(dst), skip_existing)
         }
         "bench" => {
             let path = rest.first().copied().unwrap_or("/");
@@ -120,13 +126,15 @@ fn print_usage() {
            applesauce-cat <image>                       # volume info\n  \
            applesauce-cat <image> ls [path]             # list directory (default: /)\n  \
            applesauce-cat <image> cat <path>            # dump file to stdout\n  \
-           applesauce-cat <image> pull <src> <dst-dir>  # recursive copy off the volume\n  \
+           applesauce-cat <image> pull <src> <dst-dir> [--skip-existing]  # recursive copy off the volume\n  \
            applesauce-cat <image> bench [path]          # perf smoke test\n  \
            applesauce-cat --disk N [...]                # read \\\\.\\PhysicalDriveN (Admin)\n\
          \n\
          pull is restartable: it skips destination files whose size and\n\
          mtime already match the source, and writes each in-flight file\n\
          to <name>.applesauce-partial before renaming on success.\n\
+         --skip-existing widens the skip rule to any file already at the\n\
+         destination path, regardless of size or mtime.\n\
          \n\
          bench measures the cost of metadata + read operations under a\n\
          directory: cold + warm `stat` on each child, one `list_dir`,\n\
@@ -337,9 +345,13 @@ fn cmd_pull<S: std::io::Read + std::io::Seek + Send>(
     fs: &mut Hfsplus<S>,
     src: &str,
     dst_dir: &Path,
+    skip_existing: bool,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
-    let opts = PullOptions::default();
+    let opts = PullOptions {
+        skip_existing,
+        ..PullOptions::default()
+    };
     let cancel = AtomicBool::new(false);
 
     let mut files_seen: u64 = 0;

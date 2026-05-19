@@ -172,6 +172,11 @@ mod app {
         chosen_letter: HashMap<(u32, u64), String>,
         // Per-row source path for inline (single-path) Pull.
         pull_src: HashMap<(u32, u64), String>,
+        // When true, pulls skip any destination file that already
+        // exists by name — regardless of size or mtime. Lets a user
+        // pre-populate the destination by hand and have pull touch
+        // only the gaps.
+        skip_existing: bool,
         status: String,
         admin: bool,
         service_installed: bool,
@@ -192,6 +197,7 @@ mod app {
                 pulling: None,
                 chosen_letter: Default::default(),
                 pull_src: Default::default(),
+                skip_existing: false,
                 status: String::new(),
                 admin,
                 service_installed,
@@ -345,7 +351,8 @@ mod app {
                 Some(v) => v.clone(),
                 None => return,
             };
-            self.start_pull_roots(&v, vec![(src_path.clone(), dst_dir.clone())], dst_dir);
+            let skip = self.skip_existing;
+            self.start_pull_roots(&v, vec![(src_path.clone(), dst_dir.clone())], dst_dir, skip);
             self.status = format!("Pulling {src_path}…");
         }
 
@@ -359,6 +366,7 @@ mod app {
             v: &ScannedVolume,
             roots: Vec<(String, PathBuf)>,
             dst_root: PathBuf,
+            skip_existing: bool,
         ) {
             if self.pulling.is_some() {
                 self.status = "Another pull is already running.".to_string();
@@ -395,6 +403,7 @@ mod app {
                     skipped_w,
                     errors_w,
                     last_file_w,
+                    skip_existing,
                 );
                 let _ = tx.send(PullDone { result });
             });
@@ -636,7 +645,21 @@ mod app {
                         "Scanning physical disks needs Administrator. Mounting itself doesn't.",
                     );
                 }
-                ui.label(&self.status);
+                ui.horizontal(|ui| {
+                    ui.add_enabled(
+                        self.pulling.is_none(),
+                        egui::Checkbox::new(
+                            &mut self.skip_existing,
+                            "Skip files already at destination",
+                        ),
+                    )
+                    .on_hover_text(
+                        "When on, pull skips any file whose name already exists at the destination \
+                         — regardless of size or mtime. Use when you've curated the destination \
+                         by hand. When off, pull re-copies any file whose size or mtime differs.",
+                    );
+                    ui.label(&self.status);
+                });
             });
 
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -696,7 +719,8 @@ mod app {
                     {
                         let selected: BTreeSet<String> = paths.into_iter().collect();
                         let roots = App::roots_for_selection(&selected, &dst);
-                        self.start_pull_roots(&vol, roots, dst.clone());
+                        let skip = self.skip_existing;
+                        self.start_pull_roots(&vol, roots, dst.clone(), skip);
                         self.status = format!("Pulling {} root(s)…", selected.len());
                     }
                 }
@@ -1060,11 +1084,15 @@ mod app {
         skipped: Arc<AtomicU64>,
         errors: Arc<AtomicU64>,
         last_file: Arc<std::sync::Mutex<String>>,
+        skip_existing: bool,
     ) -> anyhow::Result<PullStats> {
         let source = PhysicalDisk::open(vol.drive_number)?;
         let window = Window::new(source, vol.start_byte, vol.length_bytes)?;
         let mut fs = Hfsplus::open(window, 0)?;
-        let opts = PullOptions::default();
+        let opts = PullOptions {
+            skip_existing,
+            ..PullOptions::default()
+        };
 
         let mut total = PullStats::default();
         for (src_path, dst_parent) in roots {

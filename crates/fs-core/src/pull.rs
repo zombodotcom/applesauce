@@ -44,6 +44,14 @@ pub struct PullOptions {
     /// filesystems round mtimes to 2-second precision, so a 2s window
     /// avoids false re-copies.
     pub mtime_tolerance_secs: u64,
+    /// When `true`, skip any destination file that already exists by
+    /// name — even if its size or mtime differs from the source. Use
+    /// when you've already curated the destination and want pull to
+    /// touch only files that aren't there yet.
+    ///
+    /// When `false` (default), pull does a size + mtime comparison
+    /// and re-copies the file if either differs.
+    pub skip_existing: bool,
 }
 
 impl Default for PullOptions {
@@ -51,6 +59,7 @@ impl Default for PullOptions {
         Self {
             buffer_size: 1024 * 1024,
             mtime_tolerance_secs: 2,
+            skip_existing: false,
         }
     }
 }
@@ -260,8 +269,15 @@ fn copy_file<FS, F>(
     FS: MacFilesystem + ?Sized,
     F: FnMut(PullEvent),
 {
-    // Already-copied? Skip if the existing file matches size + mtime.
-    if already_matches(dst, size, src_modified, options.mtime_tolerance_secs) {
+    // Already-copied? Skip if the existing file matches size + mtime,
+    // or if --skip-existing is set and any file exists at the dst path.
+    if already_matches(
+        dst,
+        size,
+        src_modified,
+        options.mtime_tolerance_secs,
+        options.skip_existing,
+    ) {
         stats.skipped += 1;
         on_event(PullEvent::SkippedExisting {
             src: src.to_string(),
@@ -380,10 +396,14 @@ fn already_matches(
     src_size: u64,
     src_mtime: Option<SystemTime>,
     tolerance_secs: u64,
+    skip_existing: bool,
 ) -> bool {
     let Ok(md) = std::fs::metadata(dst) else {
         return false;
     };
+    if skip_existing {
+        return true;
+    }
     if md.len() != src_size {
         return false;
     }
@@ -530,5 +550,28 @@ mod tests {
             "txt.applesauce-partial"
         );
         assert_eq!(partial_extension(Path::new("foo")), "applesauce-partial");
+    }
+
+    #[test]
+    fn skip_existing_short_circuits_when_dst_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "applesauce-skip-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("file.bin");
+        std::fs::write(&dst, b"already-here").unwrap();
+
+        // Without skip_existing: size mismatch -> overwrite (returns false).
+        assert!(!already_matches(&dst, 99_999, None, 2, false));
+        // With skip_existing: any file at the path is treated as "done".
+        assert!(already_matches(&dst, 99_999, None, 2, true));
+        // skip_existing on a missing dst still returns false (nothing to skip).
+        assert!(!already_matches(&dir.join("missing.bin"), 0, None, 2, true));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
