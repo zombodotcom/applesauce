@@ -65,13 +65,17 @@ mod app {
 
 #[cfg(windows)]
 mod app {
-    use std::collections::{BTreeSet, HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
+
+    /// Cap on retained pull-log lines. Old lines are dropped from the
+    /// front as new events arrive — the UI shows the most recent batch.
+    const PULL_LOG_CAPACITY: usize = 500;
 
     use block_source::partition::{self, Partition, PartitionScheme};
     use block_source::physical::{self, DiskInfo, PhysicalDisk};
@@ -121,7 +125,10 @@ mod app {
         bytes: Arc<AtomicU64>,
         skipped: Arc<AtomicU64>,
         errors: Arc<AtomicU64>,
-        last_file: Arc<std::sync::Mutex<String>>,
+        last_file: Arc<Mutex<String>>,
+        /// Rolling log of recent events (copied / skipped / error).
+        /// Bounded by [`PULL_LOG_CAPACITY`].
+        log: Arc<Mutex<VecDeque<String>>>,
         cancel: Arc<AtomicBool>,
         handle: Option<JoinHandle<()>>,
         rx: Receiver<PullDone>,
@@ -381,7 +388,9 @@ mod app {
             let bytes = Arc::new(AtomicU64::new(0));
             let skipped = Arc::new(AtomicU64::new(0));
             let errors = Arc::new(AtomicU64::new(0));
-            let last_file = Arc::new(std::sync::Mutex::new(String::new()));
+            let last_file = Arc::new(Mutex::new(String::new()));
+            let log: Arc<Mutex<VecDeque<String>>> =
+                Arc::new(Mutex::new(VecDeque::with_capacity(PULL_LOG_CAPACITY)));
             let cancel = Arc::new(AtomicBool::new(false));
 
             let (tx, rx) = mpsc::channel::<PullDone>();
@@ -390,6 +399,7 @@ mod app {
             let skipped_w = skipped.clone();
             let errors_w = errors.clone();
             let last_file_w = last_file.clone();
+            let log_w = log.clone();
             let cancel_w = cancel.clone();
             let v_w = v.clone();
 
@@ -403,6 +413,7 @@ mod app {
                     skipped_w,
                     errors_w,
                     last_file_w,
+                    log_w,
                     skip_existing,
                 );
                 let _ = tx.send(PullDone { result });
@@ -414,6 +425,7 @@ mod app {
                 skipped,
                 errors,
                 last_file,
+                log,
                 cancel,
                 handle: Some(handle),
                 rx,
@@ -662,6 +674,76 @@ mod app {
                 });
             });
 
+            // Pull-progress panel: dedicated bottom panel so Cancel and
+            // the log stay visible regardless of which view is on top.
+            let mut cancel_clicked = false;
+            if let Some(p) = &self.pulling {
+                egui::TopBottomPanel::bottom("pull-progress")
+                    .resizable(true)
+                    .min_height(140.0)
+                    .default_height(200.0)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading("Pull in progress");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add(egui::Button::new("⏹ Cancel").min_size(
+                                            egui::vec2(90.0, 24.0),
+                                        ))
+                                        .clicked()
+                                    {
+                                        cancel_clicked = true;
+                                    }
+                                },
+                            );
+                        });
+
+                        let files = p.files.load(Ordering::Relaxed);
+                        let bytes = p.bytes.load(Ordering::Relaxed);
+                        let skipped = p.skipped.load(Ordering::Relaxed);
+                        let errors = p.errors.load(Ordering::Relaxed);
+                        let mb = bytes as f64 / (1u64 << 20) as f64;
+                        let elapsed = p.started_at.elapsed();
+                        let mbps = if elapsed.as_secs_f64() > 0.0 {
+                            mb / elapsed.as_secs_f64()
+                        } else {
+                            0.0
+                        };
+                        ui.label(format!("→ {}", p.dst_root.display()));
+                        ui.label(format!(
+                            "{files} files · {mb:.2} MiB · {mbps:.1} MiB/s · \
+                             {skipped} skipped · {errors} errors"
+                        ));
+                        let last = p
+                            .last_file
+                            .lock()
+                            .ok()
+                            .map(|g| g.clone())
+                            .unwrap_or_default();
+                        if !last.is_empty() {
+                            ui.small(format!("last: {last}"));
+                        }
+
+                        ui.separator();
+                        ui.small("Log (most recent at bottom — scrolls automatically)");
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                if let Ok(buf) = p.log.lock() {
+                                    for line in buf.iter() {
+                                        ui.small(line);
+                                    }
+                                }
+                            });
+                    });
+            }
+            if cancel_clicked {
+                self.cancel_pull();
+            }
+
             egui::CentralPanel::default().show(ctx, |ui| {
                 let mut mount_request: Option<(usize, String)> = None;
                 let mut pull_request: Option<(usize, String)> = None;
@@ -734,41 +816,6 @@ mod app {
                 }
                 if let Some((idx, letter)) = mount_request {
                     self.start_mount(idx, letter);
-                }
-
-                // In-progress pull panel — shown in both views.
-                if let Some(p) = &self.pulling {
-                    ctx.request_repaint();
-                    ui.add_space(12.0);
-                    ui.heading("Pull in progress");
-                    let files = p.files.load(Ordering::Relaxed);
-                    let bytes = p.bytes.load(Ordering::Relaxed);
-                    let skipped = p.skipped.load(Ordering::Relaxed);
-                    let errors = p.errors.load(Ordering::Relaxed);
-                    let mb = bytes as f64 / (1u64 << 20) as f64;
-                    let elapsed = p.started_at.elapsed();
-                    let mbps = if elapsed.as_secs_f64() > 0.0 {
-                        mb / elapsed.as_secs_f64()
-                    } else {
-                        0.0
-                    };
-                    ui.label(format!("→ {}", p.dst_root.display()));
-                    ui.label(format!(
-                        "{files} files · {mb:.2} MiB · {mbps:.1} MiB/s · \
-                         {skipped} skipped · {errors} errors"
-                    ));
-                    let last = p
-                        .last_file
-                        .lock()
-                        .ok()
-                        .map(|g| g.clone())
-                        .unwrap_or_default();
-                    if !last.is_empty() {
-                        ui.small(format!("last: {last}"));
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.cancel_pull();
-                    }
                 }
             });
         }
@@ -1083,7 +1130,8 @@ mod app {
         bytes: Arc<AtomicU64>,
         skipped: Arc<AtomicU64>,
         errors: Arc<AtomicU64>,
-        last_file: Arc<std::sync::Mutex<String>>,
+        last_file: Arc<Mutex<String>>,
+        log: Arc<Mutex<VecDeque<String>>>,
         skip_existing: bool,
     ) -> anyhow::Result<PullStats> {
         let source = PhysicalDisk::open(vol.drive_number)?;
@@ -1100,27 +1148,44 @@ mod app {
                 break;
             }
             std::fs::create_dir_all(dst_parent)?;
+            push_log(&log, format!("→ root {src_path}"));
 
             let files = files.clone();
             let bytes = bytes.clone();
             let skipped = skipped.clone();
             let errors = errors.clone();
             let last_file = last_file.clone();
+            let log_ev = log.clone();
             let mut on_event = |ev: PullEvent| match ev {
                 PullEvent::FinishedFile {
-                    dst, bytes_written, ..
+                    src,
+                    dst,
+                    bytes_written,
                 } => {
                     files.fetch_add(1, Ordering::Relaxed);
                     bytes.fetch_add(bytes_written, Ordering::Relaxed);
                     if let Ok(mut s) = last_file.lock() {
                         *s = dst.display().to_string();
                     }
+                    push_log(
+                        &log_ev,
+                        format!("  {} ({})", src, human_bytes(bytes_written)),
+                    );
                 }
-                PullEvent::SkippedExisting { .. } | PullEvent::SkippedPrivate { .. } => {
+                PullEvent::SkippedExisting { src, size, .. } => {
                     skipped.fetch_add(1, Ordering::Relaxed);
+                    push_log(&log_ev, format!("  = skip {} ({})", src, human_bytes(size)));
                 }
-                PullEvent::Error { .. } => {
+                PullEvent::SkippedPrivate { name, .. } => {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    push_log(&log_ev, format!("  = skip private {name}"));
+                }
+                PullEvent::Error { src, message } => {
                     errors.fetch_add(1, Ordering::Relaxed);
+                    push_log(&log_ev, format!("  ! {src}: {message}"));
+                }
+                PullEvent::EnteredDir { src, .. } => {
+                    push_log(&log_ev, format!("  · dir {src}"));
                 }
                 _ => {}
             };
@@ -1133,6 +1198,17 @@ mod app {
             total.errors += stats.errors;
         }
         Ok(total)
+    }
+
+    /// Append one line to a bounded pull-log ring buffer, dropping the
+    /// oldest line if the cap would be exceeded.
+    fn push_log(log: &Arc<Mutex<VecDeque<String>>>, line: String) {
+        if let Ok(mut buf) = log.lock() {
+            if buf.len() >= PULL_LOG_CAPACITY {
+                buf.pop_front();
+            }
+            buf.push_back(line);
+        }
     }
 
     /// Open the disk + volume just long enough to list one directory.
