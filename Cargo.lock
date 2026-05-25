@@ -1322,6 +1322,8 @@ dependencies = [
  "binrw",
  "block-source",
  "byteorder",
+ "flate2",
+ "lzfse_rust",
  "quick_cache",
  "thiserror 1.0.69",
  "tracing",
@@ -2008,6 +2010,12 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "lzfse_rust"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5edeac3ec657925dececc672bdd58fa2212291886ddcb3e08aa46924c78340c6"
 
 [[package]]
 name = "malloc_buf"

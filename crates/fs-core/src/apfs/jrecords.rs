@@ -96,6 +96,19 @@ pub struct InodeVal {
     pub modified: Option<SystemTime>,
 }
 
+/// `bsd_flags` offset in `j_inode_val_t`, and the `UF_COMPRESSED` bit
+/// that marks a decmpfs-compressed file.
+const INO_OFF_BSD_FLAGS: usize = 68;
+const UF_COMPRESSED: u32 = 0x0000_0020;
+
+/// True if the inode's `bsd_flags` mark it decmpfs-compressed (its data
+/// lives in xattrs, not file extents).
+pub fn parse_inode_compressed(val: &[u8]) -> bool {
+    val.get(INO_OFF_BSD_FLAGS..INO_OFF_BSD_FLAGS + 4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) & UF_COMPRESSED != 0)
+        .unwrap_or(false)
+}
+
 /// Parse the fixed portion of a `j_inode_val_t`.
 pub fn parse_inode_val(val: &[u8]) -> Option<InodeVal> {
     let mode = u16::from_le_bytes(val.get(INO_OFF_MODE..INO_OFF_MODE + 2)?.try_into().unwrap());
@@ -114,6 +127,40 @@ pub fn parse_inode_val(val: &[u8]) -> Option<InodeVal> {
         created: ns_to_systemtime(create_ns),
         modified: ns_to_systemtime(mod_ns),
     })
+}
+
+// --- extended attributes (xattr) -----------------------------------
+
+/// `j_xattr_flags` bit: the value is a data stream (xdata holds a
+/// `j_xattr_dstream` referencing extents) rather than inline bytes.
+pub const XATTR_DATA_STREAM: u16 = 0x0001;
+/// `j_xattr_flags` bit: the value bytes are embedded in xdata.
+pub const XATTR_DATA_EMBEDDED: u16 = 0x0002;
+
+/// Parse an XATTR key's name (`j_key` + u16 name_len + NUL-term name).
+pub fn parse_xattr_name(key: &[u8]) -> Option<String> {
+    let name_len = u16::from_le_bytes(key.get(8..10)?.try_into().unwrap()) as usize;
+    let raw = key.get(10..10 + name_len)?;
+    let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+    Some(String::from_utf8_lossy(&raw[..end]).into_owned())
+}
+
+/// Parse an XATTR value header → `(flags, xdata)`.
+pub fn parse_xattr_val(val: &[u8]) -> Option<(u16, &[u8])> {
+    let flags = u16::from_le_bytes(val.get(0..2)?.try_into().unwrap());
+    let xdata_len = u16::from_le_bytes(val.get(2..4)?.try_into().unwrap()) as usize;
+    let xdata = val.get(4..4 + xdata_len)?;
+    Some((flags, xdata))
+}
+
+/// Parse a `j_xattr_dstream` (xdata of a streamed xattr) →
+/// `(xattr_obj_id, size)`. The bytes live in FILE_EXTENT records keyed
+/// by `xattr_obj_id`.
+pub fn parse_xattr_dstream(xdata: &[u8]) -> Option<(u64, u64)> {
+    let obj_id = u64::from_le_bytes(xdata.get(0..8)?.try_into().unwrap());
+    // j_dstream follows; its first u64 is the size.
+    let size = u64::from_le_bytes(xdata.get(8..16)?.try_into().unwrap());
+    Some((obj_id, size))
 }
 
 // --- file extents + data stream ------------------------------------

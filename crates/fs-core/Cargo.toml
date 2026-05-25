@@ -16,4 +16,9 @@ byteorder.workspace = true
 # Sharded interior-mutable cache. Lets Hfsplus serve cached results
 # from `&self` so we don't lock-contend a single Mutex<LruCache>.
 quick_cache = "0.6"
+# decmpfs transparent compression. zlib via flate2's pure-Rust
+# miniz_oxide backend (no C toolchain); LZFSE via the pure-Rust
+# lzfse_rust crate. LZVN is implemented in-tree (small codec).
+flate2 = "1"
+lzfse_rust = "0.2"
 block-source = { path = "../block-source" }

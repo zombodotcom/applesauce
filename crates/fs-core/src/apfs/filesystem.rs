@@ -35,14 +35,24 @@ use quick_cache::sync::Cache;
 use crate::{DirEntry, MacFilesystem, Stat};
 
 use super::btree::{VarKvNode, BTREE_INFO_SIZE};
+use super::decmpfs::{
+    decompress_inline, decompress_resource_fork, DecmpfsHeader, DECMPFS_HEADER_LEN,
+};
 use super::jrecords::{
     parse_drec_name, parse_drec_val, parse_file_extent_key, parse_file_extent_val,
-    parse_inode_size, parse_inode_val, DirRec, FileExtent, InodeVal, JKey, APFS_TYPE_DIR_REC,
-    APFS_TYPE_FILE_EXTENT, APFS_TYPE_INODE, ROOT_DIR_INO,
+    parse_inode_compressed, parse_inode_size, parse_inode_val, parse_xattr_dstream,
+    parse_xattr_name, parse_xattr_val, DirRec, FileExtent, InodeVal, JKey, APFS_TYPE_DIR_REC,
+    APFS_TYPE_FILE_EXTENT, APFS_TYPE_INODE, APFS_TYPE_XATTR, ROOT_DIR_INO, XATTR_DATA_EMBEDDED,
+    XATTR_DATA_STREAM,
 };
 use super::object::BlockReader;
 use super::omap::Omap;
 use super::types::{Oid, Paddr, Xid};
+
+/// Extended-attribute name holding the decmpfs compression header.
+const XATTR_DECMPFS: &str = "com.apple.decmpfs";
+/// Extended-attribute name holding resource-fork-stored compressed data.
+const XATTR_RESOURCE_FORK: &str = "com.apple.ResourceFork";
 
 /// `BTREE_PHYSICAL` bit in `btree_info.bt_fixed.bt_flags`: child
 /// pointers are block addresses rather than virtual oids. (Bit 0x2 is
@@ -71,6 +81,9 @@ const PATH_CACHE_CAPACITY: usize = 4096;
 /// Cache of inode oid → logical size. Listing a directory stats every
 /// child for its size; caching avoids re-reading inodes on re-list.
 const SIZE_CACHE_CAPACITY: usize = 65536;
+/// Cache of fully-decompressed decmpfs file content by inode oid.
+/// Bounded by count — compressed files are typically small.
+const CONTENT_CACHE_CAPACITY: usize = 64;
 
 /// A read-only APFS volume.
 pub struct ApfsVolume<S> {
@@ -93,6 +106,7 @@ pub struct ApfsVolume<S> {
     children_cache: Cache<Oid, Arc<Vec<DirRec>>>,
     path_cache: Cache<String, (Oid, bool)>,
     size_cache: Cache<Oid, u64>,
+    content_cache: Cache<Oid, Arc<Vec<u8>>>,
 }
 
 impl<S: Read + Seek + Send> ApfsVolume<S> {
@@ -139,6 +153,7 @@ impl<S: Read + Seek + Send> ApfsVolume<S> {
             children_cache: Cache::new(CHILDREN_CACHE_CAPACITY),
             path_cache: Cache::new(PATH_CACHE_CAPACITY),
             size_cache: Cache::new(SIZE_CACHE_CAPACITY),
+            content_cache: Cache::new(CONTENT_CACHE_CAPACITY),
         })
     }
 
@@ -278,16 +293,93 @@ impl<S: Read + Seek + Send> ApfsVolume<S> {
     }
 
     /// Logical size of a file inode (0 if it has no data stream), cached.
+    /// For decmpfs-compressed files the size is the uncompressed size
+    /// from the decmpfs header, not the (zero) regular data stream.
     fn inode_size(&mut self, oid: Oid) -> Result<u64> {
         if let Some(sz) = self.size_cache.get(&oid) {
             return Ok(sz);
         }
-        let sz = self
-            .inode_record(oid)?
-            .and_then(|v| parse_inode_size(&v))
-            .unwrap_or(0);
+        let sz = match self.inode_record(oid)? {
+            Some(rec) if parse_inode_compressed(&rec) => self
+                .read_xattr(oid, XATTR_DECMPFS)?
+                .and_then(|attr| DecmpfsHeader::parse(&attr).ok())
+                .map(|h| h.uncompressed_size)
+                .unwrap_or(0),
+            Some(rec) => parse_inode_size(&rec).unwrap_or(0),
+            None => 0,
+        };
         self.size_cache.insert(oid, sz);
         Ok(sz)
+    }
+
+    /// Read a named extended attribute's bytes for an inode. Handles both
+    /// embedded values and stream-backed ones (read via their extents).
+    fn read_xattr(&mut self, inode_oid: Oid, name: &str) -> Result<Option<Vec<u8>>> {
+        let recs = self.collect_records(inode_oid, APFS_TYPE_XATTR)?;
+        let mut stream: Option<(u64, u64)> = None;
+        for (key, val) in &recs {
+            if parse_xattr_name(key).as_deref() != Some(name) {
+                continue;
+            }
+            let Some((flags, xdata)) = parse_xattr_val(val) else {
+                return Ok(None);
+            };
+            if flags & XATTR_DATA_EMBEDDED != 0 {
+                return Ok(Some(xdata.to_vec()));
+            }
+            if flags & XATTR_DATA_STREAM != 0 {
+                stream = parse_xattr_dstream(xdata);
+            }
+            break;
+        }
+        match stream {
+            Some((obj_id, size)) => Ok(Some(self.read_stream(obj_id, size)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read all `size` bytes of a data stream identified by `obj_id`
+    /// (its FILE_EXTENT records), into a freshly allocated buffer.
+    fn read_stream(&mut self, obj_id: Oid, size: u64) -> Result<Vec<u8>> {
+        let extents = self.file_extents(obj_id)?;
+        let bs = self.block_size as u64;
+        let mut out = vec![0u8; size as usize];
+        for e in &extents {
+            if e.phys_block == 0 || e.logical_addr >= size {
+                continue; // sparse hole stays zero
+            }
+            let n = e.len.min(size - e.logical_addr) as usize;
+            let start = e.logical_addr as usize;
+            self.read_at(e.phys_block * bs, &mut out[start..start + n])?;
+        }
+        Ok(out)
+    }
+
+    /// Fully-decompressed content of a decmpfs file (cached). Returns
+    /// `None` if the inode isn't compressed.
+    fn decmpfs_content(&mut self, oid: Oid) -> Result<Option<Arc<Vec<u8>>>> {
+        if let Some(c) = self.content_cache.get(&oid) {
+            return Ok(Some(c));
+        }
+        let Some(attr) = self.read_xattr(oid, XATTR_DECMPFS)? else {
+            return Ok(None);
+        };
+        let header = DecmpfsHeader::parse(&attr)?;
+        let content = if header.is_resource_fork() {
+            let rsrc = self.read_xattr(oid, XATTR_RESOURCE_FORK)?.ok_or_else(|| {
+                anyhow!(
+                    "decmpfs type {} but no resource fork on inode {oid}",
+                    header.compression_type
+                )
+            })?;
+            decompress_resource_fork(header.compression_type, &rsrc, header.uncompressed_size)?
+        } else {
+            let payload = attr.get(DECMPFS_HEADER_LEN..).unwrap_or(&[]);
+            decompress_inline(header.compression_type, payload, header.uncompressed_size)?
+        };
+        let arc = Arc::new(content);
+        self.content_cache.insert(oid, arc.clone());
+        Ok(Some(arc))
     }
 
     /// All extents of a file, sorted by logical offset.
@@ -400,6 +492,27 @@ impl<S: Read + Seek + Send> MacFilesystem for ApfsVolume<S> {
         if is_dir {
             bail!("{path} is a directory");
         }
+
+        // Compressed files keep their data in xattrs, not file extents.
+        // Serve from the (cached) fully-decompressed content.
+        let compressed = self
+            .inode_record(oid)?
+            .as_deref()
+            .map(parse_inode_compressed)
+            .unwrap_or(false);
+        if compressed {
+            let content = self
+                .decmpfs_content(oid)?
+                .ok_or_else(|| anyhow!("{path}: marked compressed but has no decmpfs attribute"))?;
+            if offset >= content.len() as u64 || buf.is_empty() {
+                return Ok(0);
+            }
+            let start = offset as usize;
+            let n = buf.len().min(content.len() - start);
+            buf[..n].copy_from_slice(&content[start..start + n]);
+            return Ok(n);
+        }
+
         let size = self.inode_size(oid)?;
         if offset >= size || buf.is_empty() {
             return Ok(0);

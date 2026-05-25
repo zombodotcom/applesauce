@@ -34,6 +34,7 @@
 
 pub mod btree;
 pub mod container;
+pub mod decmpfs;
 pub mod filesystem;
 pub mod jrecords;
 pub mod object;
