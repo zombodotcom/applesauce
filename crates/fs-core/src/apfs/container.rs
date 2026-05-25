@@ -12,6 +12,7 @@ use std::io::{Read, Seek};
 use anyhow::{anyhow, bail, Result};
 use binrw::{BinRead, BinReaderExt};
 
+use super::filesystem::ApfsVolume;
 use super::object::{block_checksum_ok, BlockReader};
 use super::omap::Omap;
 use super::types::{
@@ -203,6 +204,25 @@ impl<S: Read + Seek> ApfsContainer<S> {
             }
         }
         Ok(out)
+    }
+
+    /// Open one volume as a [`MacFilesystem`], consuming the container's
+    /// source. (Each mounted/browsed volume otherwise wants its own
+    /// source handle — the caller re-opens the disk per volume.)
+    pub fn open_volume(self, info: &ApfsVolumeInfo) -> Result<ApfsVolume<S>>
+    where
+        S: Send,
+    {
+        ApfsVolume::open(
+            self.source,
+            self.block_size,
+            info.omap_oid as Paddr,
+            info.root_tree_oid,
+            info.xid,
+            info.hashed_drec_keys,
+            info.case_insensitive,
+            info.name.clone(),
+        )
     }
 }
 

@@ -11,7 +11,7 @@ use std::io::{Read, Seek};
 use anyhow::{bail, Result};
 
 use super::object::BlockReader;
-use super::types::{Oid, Paddr, APFS_MAGIC};
+use super::types::{Oid, Paddr, Xid, APFS_MAGIC};
 
 // Field offsets within apfs_superblock_t (after the 32-byte obj header).
 const OFF_MAGIC: usize = 32;
@@ -30,8 +30,10 @@ const VOLNAME_LEN: usize = 256;
 /// Encrypted volumes have this clear.
 const APFS_FS_UNENCRYPTED: u64 = 0x0000_0001;
 
-/// `apfs_incompatible_features` bit: case-sensitive comparison.
+/// `apfs_incompatible_features` bit: case-insensitive comparison.
 const APFS_INCOMPAT_CASE_INSENSITIVE: u64 = 0x0000_0001;
+/// `apfs_incompatible_features` bit: normalization-insensitive names.
+const APFS_INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 0x0000_0008;
 
 /// Parsed, human-facing metadata for one APFS volume.
 #[derive(Debug, Clone)]
@@ -40,6 +42,11 @@ pub struct ApfsVolumeInfo {
     pub fs_oid: Oid,
     /// Physical block where the superblock was found.
     pub paddr: Paddr,
+    /// Transaction id (`o_xid`) of this superblock. Used as the ceiling
+    /// when resolving fs-tree objects through the volume object map, so
+    /// we read the snapshot consistent with this superblock rather than
+    /// a newer (possibly uncommitted) transaction's objects.
+    pub xid: Xid,
     /// Volume name (UTF-8, decoded from `apfs_volname`).
     pub name: String,
     /// `apfs_role` raw value.
@@ -53,9 +60,14 @@ pub struct ApfsVolumeInfo {
     pub encrypted: bool,
     /// True if name comparison is case-insensitive.
     pub case_insensitive: bool,
-    /// Object map oid (for M2 file-system walking).
+    /// True if directory-entry keys use the hashed form
+    /// (`j_drec_hashed_key_t`) — the case- or normalization-insensitive
+    /// volumes do; case-sensitive ones use a bare name length.
+    pub hashed_drec_keys: bool,
+    /// Object map oid (for file-system walking).
     pub omap_oid: Oid,
-    /// File-system (root) B-tree oid (for M2).
+    /// File-system (root) B-tree oid (virtual; resolved via the volume
+    /// object map).
     pub root_tree_oid: Oid,
 }
 
@@ -80,9 +92,13 @@ impl ApfsVolumeInfo {
         let fs_flags = read_u64(&block, OFF_FS_FLAGS)?;
         let name = read_cstr(&block, OFF_VOLNAME, VOLNAME_LEN)?;
 
+        // o_xid lives at offset 16 of the obj_phys_t header.
+        let xid = read_u64(&block, 16)?;
+
         Ok(Self {
             fs_oid,
             paddr,
+            xid,
             name,
             role: read_u16(&block, OFF_ROLE)?,
             alloc_count: read_u64(&block, OFF_FS_ALLOC_COUNT)?,
@@ -90,6 +106,9 @@ impl ApfsVolumeInfo {
             num_directories: read_u64(&block, OFF_NUM_DIRS)?,
             encrypted: fs_flags & APFS_FS_UNENCRYPTED == 0,
             case_insensitive: incompat & APFS_INCOMPAT_CASE_INSENSITIVE != 0,
+            hashed_drec_keys: incompat
+                & (APFS_INCOMPAT_CASE_INSENSITIVE | APFS_INCOMPAT_NORMALIZATION_INSENSITIVE)
+                != 0,
             omap_oid: read_u64(&block, OFF_OMAP_OID)?,
             root_tree_oid: read_u64(&block, OFF_ROOT_TREE_OID)?,
         })

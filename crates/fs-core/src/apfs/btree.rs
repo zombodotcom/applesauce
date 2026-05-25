@@ -119,3 +119,80 @@ impl FixedKvNode {
         self.block.get(start..start + val_size)
     }
 }
+
+/// A parsed variable-KV B-tree node (the file-system tree). TOC entries
+/// are `kvloc_t { k: nloc, v: nloc }` — each key and value carries its
+/// own offset *and* length, so entries vary in size.
+pub struct VarKvNode {
+    pub header: BTreeNodeHeader,
+    block: Vec<u8>,
+}
+
+impl VarKvNode {
+    pub fn parse(block: Vec<u8>) -> anyhow::Result<Self> {
+        use binrw::BinReaderExt;
+        let mut cursor = std::io::Cursor::new(&block);
+        let header: BTreeNodeHeader = cursor.read_le()?;
+        Ok(Self { header, block })
+    }
+
+    pub fn nkeys(&self) -> usize {
+        self.header.nkeys as usize
+    }
+
+    pub fn is_leaf(&self) -> bool {
+        self.header.is_leaf()
+    }
+
+    fn toc_start(&self) -> usize {
+        BTREE_NODE_DATA_OFFSET + self.header.table_space.off as usize
+    }
+
+    fn key_area_start(&self) -> usize {
+        BTREE_NODE_DATA_OFFSET
+            + self.header.table_space.off as usize
+            + self.header.table_space.len as usize
+    }
+
+    fn value_area_end(&self) -> usize {
+        if self.header.is_root() {
+            self.block.len() - BTREE_INFO_SIZE
+        } else {
+            self.block.len()
+        }
+    }
+
+    /// The `kvloc_t` for entry `i`: `(key_off, key_len, val_off, val_len)`.
+    fn kvloc(&self, i: usize) -> Option<(u16, u16, u16, u16)> {
+        let off = self.toc_start() + i * 8;
+        let k_off = u16::from_le_bytes([*self.block.get(off)?, *self.block.get(off + 1)?]);
+        let k_len = u16::from_le_bytes([*self.block.get(off + 2)?, *self.block.get(off + 3)?]);
+        let v_off = u16::from_le_bytes([*self.block.get(off + 4)?, *self.block.get(off + 5)?]);
+        let v_len = u16::from_le_bytes([*self.block.get(off + 6)?, *self.block.get(off + 7)?]);
+        Some((k_off, k_len, v_off, v_len))
+    }
+
+    /// Key bytes for entry `i`.
+    pub fn key(&self, i: usize) -> Option<&[u8]> {
+        let (k_off, k_len, _, _) = self.kvloc(i)?;
+        let start = self.key_area_start() + k_off as usize;
+        self.block.get(start..start + k_len as usize)
+    }
+
+    /// Value bytes for entry `i` (leaf record value, or an index node's
+    /// child pointer — an 8-byte oid).
+    pub fn value(&self, i: usize) -> Option<&[u8]> {
+        let (_, _, v_off, v_len) = self.kvloc(i)?;
+        let start = self.value_area_end().checked_sub(v_off as usize)?;
+        self.block.get(start..start + v_len as usize)
+    }
+
+    /// For an index node: the child node's oid (value is an 8-byte oid).
+    pub fn child_oid(&self, i: usize) -> Option<u64> {
+        let v = self.value(i)?;
+        if v.len() < 8 {
+            return None;
+        }
+        Some(u64::from_le_bytes(v[0..8].try_into().unwrap()))
+    }
+}

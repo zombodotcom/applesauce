@@ -34,10 +34,13 @@
 
 pub mod btree;
 pub mod container;
+pub mod filesystem;
+pub mod jrecords;
 pub mod object;
 pub mod omap;
 pub mod types;
 pub mod volume;
 
 pub use container::{ApfsContainer, NxSuperblock};
+pub use filesystem::ApfsVolume;
 pub use volume::ApfsVolumeInfo;

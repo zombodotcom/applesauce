@@ -62,6 +62,18 @@ fn run(args: &[String]) -> anyhow::Result<()> {
             if command == "apfs" {
                 return cmd_apfs(move || Ok(block_source::physical::PhysicalDisk::open(n)?));
             }
+            if command == "apfs-ls" {
+                let vol = rest
+                    .first()
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("apfs-ls needs a volume name"))?;
+                let path = rest.get(1).copied().unwrap_or("/");
+                return cmd_apfs_ls(
+                    move || Ok(block_source::physical::PhysicalDisk::open(n)?),
+                    vol,
+                    path,
+                );
+            }
             let source = block_source::physical::PhysicalDisk::open(n)?;
             let (volume_offset, mut fs) = open_first_hfsplus(source)?;
             return dispatch(command, &rest, &mut fs, volume_offset);
@@ -79,6 +91,16 @@ fn run(args: &[String]) -> anyhow::Result<()> {
     if command == "apfs" {
         let path = image_path.clone();
         return cmd_apfs(move || Ok(ImageFile::open(&path)?));
+    }
+    if command == "apfs-ls" {
+        let vol = rest
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("apfs-ls needs a volume name"))?
+            .to_string();
+        let path = rest.get(1).copied().unwrap_or("/").to_string();
+        let img = image_path.clone();
+        return cmd_apfs_ls(move || Ok(ImageFile::open(&img)?), &vol, &path);
     }
 
     let source = ImageFile::open(image_path)?;
@@ -129,6 +151,79 @@ where
         }
     }
     Ok(())
+}
+
+/// List a directory inside a named APFS volume. Searches every APFS
+/// container on the source for a volume whose name matches `vol_name`
+/// (case-insensitive), opens it, and lists `path`.
+fn cmd_apfs_ls<S, F>(open: F, vol_name: &str, path: &str) -> anyhow::Result<()>
+where
+    S: BlockSource + 'static,
+    F: Fn() -> anyhow::Result<S>,
+{
+    let mut probe_src = open()?;
+    let parts = partition::probe(&mut probe_src)?;
+    drop(probe_src);
+
+    // Each entry is the window into one container; `None` = whole source.
+    let targets: Vec<Option<(u64, u64)>> = if parts.is_empty() {
+        vec![None]
+    } else {
+        let cs: Vec<Option<(u64, u64)>> = parts
+            .iter()
+            .filter(|p| is_apfs_container(p))
+            .map(|p| Some((p.start_byte, p.length_bytes)))
+            .collect();
+        if cs.is_empty() {
+            anyhow::bail!("no APFS containers found on source");
+        }
+        cs
+    };
+
+    let mut available = Vec::new();
+    for t in targets {
+        // Always go through a Window so both arms have the same type.
+        let (start, len) = match t {
+            Some((s, l)) => (s, l),
+            None => {
+                let probe = open()?;
+                let len = probe
+                    .len_bytes()
+                    .ok_or_else(|| anyhow::anyhow!("source length unknown"))?;
+                (0, len)
+            }
+        };
+        let mut container = ApfsContainer::open(Window::new(open()?, start, len)?)?;
+        let vols = container.volumes()?;
+        if let Some(info) = vols
+            .iter()
+            .find(|v| v.name.eq_ignore_ascii_case(vol_name))
+            .cloned()
+        {
+            if info.encrypted {
+                anyhow::bail!(
+                    "volume “{}” is FileVault-encrypted; reading it needs the key (not yet supported)",
+                    info.name
+                );
+            }
+            let mut fs = container.open_volume(&info)?;
+            let entries = fs.list_dir(path)?;
+            println!("{} {}  ({} entries)", info.name, path, entries.len());
+            if entries.is_empty() {
+                println!("(empty)");
+                return Ok(());
+            }
+            println!("{:<6}  NAME", "KIND");
+            for e in entries {
+                println!("{:<6}  {}", if e.is_dir { "DIR" } else { "FILE" }, e.name);
+            }
+            println!("\n(note: file sizes/contents arrive in M3)");
+            return Ok(());
+        }
+        available.extend(vols.into_iter().map(|v| v.name));
+    }
+
+    anyhow::bail!("volume {vol_name:?} not found. Available volumes: {available:?}");
 }
 
 fn print_container<S: BlockSource>(
@@ -220,8 +315,10 @@ fn print_usage() {
            applesauce-cat <image> pull <src> <dst-dir> [--skip-existing]  # recursive copy off the volume\n  \
            applesauce-cat <image> bench [path]          # perf smoke test\n  \
            applesauce-cat <image> apfs                  # list APFS containers + volumes\n  \
+           applesauce-cat <image> apfs-ls <vol> [path]  # list a dir in an APFS volume\n  \
            applesauce-cat --disk N [...]                # read \\\\.\\PhysicalDriveN (Admin)\n  \
-           applesauce-cat --disk N apfs                 # enumerate APFS volumes on a disk\n\
+           applesauce-cat --disk N apfs                 # enumerate APFS volumes on a disk\n  \
+           applesauce-cat --disk N apfs-ls <vol> [path] # list a dir in an APFS volume\n\
          \n\
          pull is restartable: it skips destination files whose size and\n\
          mtime already match the source, and writes each in-flight file\n\
