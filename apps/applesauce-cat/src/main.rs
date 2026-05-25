@@ -24,9 +24,10 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use block_source::image::ImageFile;
-use block_source::partition::{self, Partition, PartitionScheme};
+use block_source::partition::{self, Partition, PartitionScheme, APPLE_APFS_CONTAINER_GUID};
 use block_source::window::Window;
 use block_source::BlockSource;
+use fs_core::apfs::ApfsContainer;
 use fs_core::hfsplus::Hfsplus;
 use fs_core::pull::{pull_tree, PullEvent, PullOptions};
 use fs_core::MacFilesystem;
@@ -58,6 +59,9 @@ fn run(args: &[String]) -> anyhow::Result<()> {
                 .parse()?;
             let command = args.get(2).map(|s| s.as_str()).unwrap_or("info");
             let rest: Vec<&str> = args.iter().skip(3).map(|s| s.as_str()).collect();
+            if command == "apfs" {
+                return cmd_apfs(move || Ok(block_source::physical::PhysicalDisk::open(n)?));
+            }
             let source = block_source::physical::PhysicalDisk::open(n)?;
             let (volume_offset, mut fs) = open_first_hfsplus(source)?;
             return dispatch(command, &rest, &mut fs, volume_offset);
@@ -72,9 +76,96 @@ fn run(args: &[String]) -> anyhow::Result<()> {
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("info");
     let rest: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
 
+    if command == "apfs" {
+        let path = image_path.clone();
+        return cmd_apfs(move || Ok(ImageFile::open(&path)?));
+    }
+
     let source = ImageFile::open(image_path)?;
     let (volume_offset, mut fs) = open_first_hfsplus(source)?;
     dispatch(command, &rest, &mut fs, volume_offset)
+}
+
+/// True if a partition holds an APFS container (GPT GUID or APM label).
+fn is_apfs_container(p: &Partition) -> bool {
+    matches!(
+        p.type_id.as_str(),
+        APPLE_APFS_CONTAINER_GUID | "Apple_APFS" | "Apple_APFS_Container"
+    )
+}
+
+/// Enumerate APFS containers and the volumes inside them. `open`
+/// produces a fresh source each call so we can window into each
+/// container independently (a disk may hold several).
+fn cmd_apfs<S, F>(open: F) -> anyhow::Result<()>
+where
+    S: BlockSource + 'static,
+    F: Fn() -> anyhow::Result<S>,
+{
+    let mut probe_src = open()?;
+    let parts = partition::probe(&mut probe_src)?;
+    drop(probe_src);
+
+    // No partition table → treat the whole source as one container.
+    if parts.is_empty() {
+        let container = ApfsContainer::open(open()?)?;
+        return print_container("(whole disk)", container);
+    }
+
+    let containers: Vec<&Partition> = parts.iter().filter(|p| is_apfs_container(p)).collect();
+    if containers.is_empty() {
+        println!(
+            "No APFS containers found ({} partition(s) present).",
+            parts.len()
+        );
+        return Ok(());
+    }
+
+    for p in containers {
+        let window = Window::new(open()?, p.start_byte, p.length_bytes)?;
+        match ApfsContainer::open(window) {
+            Ok(container) => print_container(&p.name, container)?,
+            Err(e) => eprintln!("container “{}”: {e:#}", p.name),
+        }
+    }
+    Ok(())
+}
+
+fn print_container<S: BlockSource>(
+    label: &str,
+    mut container: ApfsContainer<S>,
+) -> anyhow::Result<()> {
+    let sb = container.superblock();
+    let block_size = container.block_size();
+    let total_gib = sb.block_count as f64 * block_size as f64 / (1u64 << 30) as f64;
+    println!(
+        "APFS container {label}: block_size={} block_count={} ({:.2} GiB)",
+        block_size, sb.block_count, total_gib,
+    );
+
+    let volumes = container.volumes()?;
+    if volumes.is_empty() {
+        println!("  (no volumes)");
+        return Ok(());
+    }
+    for v in &volumes {
+        let used_gib = v.alloc_count as f64 * block_size as f64 / (1u64 << 30) as f64;
+        println!(
+            "  • {:<28} role={:<9} {} files / {} dirs · {:.2} GiB used{}{}",
+            v.name,
+            v.role_name(),
+            v.num_files,
+            v.num_directories,
+            used_gib,
+            if v.case_insensitive {
+                " · case-insensitive"
+            } else {
+                ""
+            },
+            if v.encrypted { "  [ENCRYPTED]" } else { "" },
+        );
+    }
+    Ok(())
 }
 
 fn dispatch<S: BlockSource + 'static>(
@@ -128,7 +219,9 @@ fn print_usage() {
            applesauce-cat <image> cat <path>            # dump file to stdout\n  \
            applesauce-cat <image> pull <src> <dst-dir> [--skip-existing]  # recursive copy off the volume\n  \
            applesauce-cat <image> bench [path]          # perf smoke test\n  \
-           applesauce-cat --disk N [...]                # read \\\\.\\PhysicalDriveN (Admin)\n\
+           applesauce-cat <image> apfs                  # list APFS containers + volumes\n  \
+           applesauce-cat --disk N [...]                # read \\\\.\\PhysicalDriveN (Admin)\n  \
+           applesauce-cat --disk N apfs                 # enumerate APFS volumes on a disk\n\
          \n\
          pull is restartable: it skips destination files whose size and\n\
          mtime already match the source, and writes each in-flight file\n\

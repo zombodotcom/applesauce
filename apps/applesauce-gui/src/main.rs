@@ -689,9 +689,10 @@ mod app {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui
-                                        .add(egui::Button::new("⏹ Cancel").min_size(
-                                            egui::vec2(90.0, 24.0),
-                                        ))
+                                        .add(
+                                            egui::Button::new("⏹ Cancel")
+                                                .min_size(egui::vec2(90.0, 24.0)),
+                                        )
                                         .clicked()
                                     {
                                         cancel_clicked = true;
