@@ -60,6 +60,17 @@ const NODE_CACHE_CAPACITY: usize = 4096;
 /// Cache of resolved virtual-oid → block-address mappings, so we don't
 /// re-descend the volume object map for hot nodes.
 const PADDR_CACHE_CAPACITY: usize = 16384;
+/// Cache of `list_children` results by directory oid. Explorer re-lists
+/// directories on sort/filter/pane changes, and path resolution lists
+/// each component dir — without this every one re-walks the tree.
+const CHILDREN_CACHE_CAPACITY: usize = 1024;
+/// Cache of resolved POSIX path → (oid, is_dir). WinFsp does
+/// get_security_by_name → open → get_file_info on the same path
+/// back-to-back; this collapses those to one walk.
+const PATH_CACHE_CAPACITY: usize = 4096;
+/// Cache of inode oid → logical size. Listing a directory stats every
+/// child for its size; caching avoids re-reading inodes on re-list.
+const SIZE_CACHE_CAPACITY: usize = 65536;
 
 /// A read-only APFS volume.
 pub struct ApfsVolume<S> {
@@ -79,6 +90,9 @@ pub struct ApfsVolume<S> {
     volume_label: String,
     node_cache: Cache<Oid, Arc<VarKvNode>>,
     paddr_cache: Cache<Oid, Paddr>,
+    children_cache: Cache<Oid, Arc<Vec<DirRec>>>,
+    path_cache: Cache<String, (Oid, bool)>,
+    size_cache: Cache<Oid, u64>,
 }
 
 impl<S: Read + Seek + Send> ApfsVolume<S> {
@@ -122,6 +136,9 @@ impl<S: Read + Seek + Send> ApfsVolume<S> {
             volume_label,
             node_cache: Cache::new(NODE_CACHE_CAPACITY),
             paddr_cache: Cache::new(PADDR_CACHE_CAPACITY),
+            children_cache: Cache::new(CHILDREN_CACHE_CAPACITY),
+            path_cache: Cache::new(PATH_CACHE_CAPACITY),
+            size_cache: Cache::new(SIZE_CACHE_CAPACITY),
         })
     }
 
@@ -228,8 +245,11 @@ impl<S: Read + Seek + Send> ApfsVolume<S> {
         Ok(out)
     }
 
-    /// List a directory's entries by oid.
-    fn list_children(&mut self, dir_oid: Oid) -> Result<Vec<DirRec>> {
+    /// List a directory's entries by oid (cached).
+    fn list_children(&mut self, dir_oid: Oid) -> Result<Arc<Vec<DirRec>>> {
+        if let Some(cached) = self.children_cache.get(&dir_oid) {
+            return Ok(cached);
+        }
         let hashed = self.hashed_drec_keys;
         let recs = self.collect_records(dir_oid, APFS_TYPE_DIR_REC)?;
         let mut out = Vec::with_capacity(recs.len());
@@ -246,7 +266,9 @@ impl<S: Read + Seek + Send> ApfsVolume<S> {
                 is_dir,
             });
         }
-        Ok(out)
+        let arc = Arc::new(out);
+        self.children_cache.insert(dir_oid, arc.clone());
+        Ok(arc)
     }
 
     /// Fetch an inode's record value bytes by oid.
@@ -255,12 +277,17 @@ impl<S: Read + Seek + Send> ApfsVolume<S> {
         Ok(recs.into_iter().next().map(|(_, val)| val))
     }
 
-    /// Logical size of a file inode (0 if it has no data stream).
+    /// Logical size of a file inode (0 if it has no data stream), cached.
     fn inode_size(&mut self, oid: Oid) -> Result<u64> {
-        Ok(self
+        if let Some(sz) = self.size_cache.get(&oid) {
+            return Ok(sz);
+        }
+        let sz = self
             .inode_record(oid)?
             .and_then(|v| parse_inode_size(&v))
-            .unwrap_or(0))
+            .unwrap_or(0);
+        self.size_cache.insert(oid, sz);
+        Ok(sz)
     }
 
     /// All extents of a file, sorted by logical offset.
@@ -284,9 +311,13 @@ impl<S: Read + Seek + Send> ApfsVolume<S> {
         Ok(exts)
     }
 
-    /// Resolve a POSIX path to `(oid, is_dir)`. The root (`/` or empty)
-    /// is the volume's root directory.
+    /// Resolve a POSIX path to `(oid, is_dir)` (cached). The root (`/`
+    /// or empty) is the volume's root directory.
     fn resolve_path(&mut self, path: &str) -> Result<(Oid, bool)> {
+        if let Some(hit) = self.path_cache.get(path) {
+            return Ok(hit);
+        }
+        let case_insensitive = self.case_insensitive;
         let mut oid = ROOT_DIR_INO;
         let mut is_dir = true;
         for comp in path.split('/').filter(|s| !s.is_empty()) {
@@ -294,8 +325,8 @@ impl<S: Read + Seek + Send> ApfsVolume<S> {
                 bail!("{path}: not a directory");
             }
             let children = self.list_children(oid)?;
-            let found = children.into_iter().find(|c| {
-                if self.case_insensitive {
+            let found = children.iter().find(|c| {
+                if case_insensitive {
                     c.name.eq_ignore_ascii_case(comp)
                 } else {
                     c.name == comp
@@ -309,6 +340,7 @@ impl<S: Read + Seek + Send> ApfsVolume<S> {
                 None => bail!("path not found: {path} (no entry {comp:?})"),
             }
         }
+        self.path_cache.insert(path.to_string(), (oid, is_dir));
         Ok((oid, is_dir))
     }
 }
@@ -321,7 +353,7 @@ impl<S: Read + Seek + Send> MacFilesystem for ApfsVolume<S> {
         }
         let children = self.list_children(oid)?;
         let mut out = Vec::with_capacity(children.len());
-        for c in children {
+        for c in children.iter() {
             // Files carry their size in the inode's data stream; reading
             // it per entry is what lets pull copy the right byte count.
             let size_bytes = if c.is_dir {
@@ -330,7 +362,7 @@ impl<S: Read + Seek + Send> MacFilesystem for ApfsVolume<S> {
                 self.inode_size(c.file_id)?
             };
             out.push(Stat {
-                name: c.name,
+                name: c.name.clone(),
                 size_bytes,
                 is_dir: c.is_dir,
                 modified: None,

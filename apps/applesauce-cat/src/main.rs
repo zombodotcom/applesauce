@@ -89,6 +89,18 @@ fn run(args: &[String]) -> anyhow::Result<()> {
                     path,
                 );
             }
+            if command == "apfs-bench" {
+                let vol = rest
+                    .first()
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("apfs-bench needs a volume name"))?;
+                let path = rest.get(1).copied().unwrap_or("/");
+                return cmd_apfs_bench(
+                    move || Ok(block_source::physical::PhysicalDisk::open(n)?),
+                    vol,
+                    path,
+                );
+            }
             if command == "apfs-pull" {
                 let skip_existing = rest.contains(&"--skip-existing");
                 let pos: Vec<&str> = rest
@@ -341,6 +353,36 @@ where
         if secs > 0.0 { mb / secs } else { 0.0 },
         stats.skipped,
         stats.errors,
+    );
+    Ok(())
+}
+
+/// Measure cold vs warm directory listing on one APFS volume — the
+/// listing reads every child's inode for its size, so this exercises
+/// the children/path/size/node caches end to end.
+fn cmd_apfs_bench<S, F>(open: F, vol_name: &str, path: &str) -> anyhow::Result<()>
+where
+    S: BlockSource + 'static,
+    F: Fn() -> anyhow::Result<S>,
+{
+    let mut fs = find_apfs_volume(open, vol_name)?;
+
+    let t0 = Instant::now();
+    let entries = fs.list_dir(path)?;
+    let cold = t0.elapsed();
+    let n = entries.len();
+
+    let t1 = Instant::now();
+    let _ = fs.list_dir(path)?;
+    let warm = t1.elapsed();
+
+    let speedup = cold.as_secs_f64() / warm.as_secs_f64().max(1e-9);
+    println!(
+        "list_dir({path}) over {n} entries:\n  \
+         cold {:.2} ms\n  warm {:.2} ms  ({:.0}x faster)",
+        cold.as_secs_f64() * 1000.0,
+        warm.as_secs_f64() * 1000.0,
+        speedup,
     );
     Ok(())
 }

@@ -11,13 +11,20 @@
 //! `(oid, xid)`.
 
 use std::io::{Read, Seek};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use binrw::{BinRead, BinReaderExt};
+use quick_cache::sync::Cache;
 
 use super::btree::FixedKvNode;
 use super::object::BlockReader;
 use super::types::{Oid, Paddr, Xid};
+
+/// Cache of parsed OMAP b-tree nodes by block address. The root and
+/// index levels are re-read on every oid resolution; caching them turns
+/// a cold directory walk's many redundant OMAP reads into one.
+const OMAP_NODE_CACHE_CAPACITY: usize = 2048;
 
 /// Fixed key size for an OMAP B-tree: `omap_key` = oid(8) + xid(8).
 const OMAP_KEY_SIZE: usize = 16;
@@ -50,9 +57,11 @@ pub struct OmapVal {
     pub paddr: Paddr,
 }
 
-/// An opened object map: just the physical address of its B-tree root.
+/// An opened object map: the physical address of its B-tree root plus a
+/// cache of its parsed nodes.
 pub struct Omap {
     tree_root: Paddr,
+    node_cache: Cache<Paddr, Arc<FixedKvNode>>,
 }
 
 impl Omap {
@@ -71,7 +80,27 @@ impl Omap {
         }
         Ok(Self {
             tree_root: omap.tree_oid as Paddr,
+            node_cache: Cache::new(OMAP_NODE_CACHE_CAPACITY),
         })
+    }
+
+    /// Read and parse an OMAP b-tree node at `paddr`, consulting the
+    /// node cache (the root + index levels recur across every lookup).
+    fn node<S: Read + Seek>(
+        &self,
+        reader: &mut BlockReader<'_, S>,
+        paddr: Paddr,
+    ) -> Result<Arc<FixedKvNode>> {
+        if let Some(n) = self.node_cache.get(&paddr) {
+            return Ok(n);
+        }
+        let block = reader.read_block(paddr)?;
+        let node = Arc::new(FixedKvNode::parse(block)?);
+        if !node.header.is_fixed_kv() {
+            bail!("omap b-tree node is not fixed-kv");
+        }
+        self.node_cache.insert(paddr, node.clone());
+        Ok(node)
     }
 
     /// Resolve `oid` to its physical block, picking the entry with the
@@ -87,11 +116,7 @@ impl Omap {
 
         // Bounded descent guards against a corrupt/cyclic tree.
         for _ in 0..32 {
-            let block = reader.read_block(node_paddr)?;
-            let node = FixedKvNode::parse(block)?;
-            if !node.header.is_fixed_kv() {
-                bail!("omap b-tree node is not fixed-kv");
-            }
+            let node = self.node(reader, node_paddr)?;
 
             if node.header.is_leaf() {
                 return Ok(self.leaf_lookup(&node, oid, max_xid));
