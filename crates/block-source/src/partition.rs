@@ -12,9 +12,10 @@ use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 
 use crate::BlockSource;
 
-/// Assumed disk sector size. Real disks may use 4096; we'll detect that
-/// later via `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX`. 512 is correct for
-/// almost every external USB drive and disk image we'll encounter.
+/// Default sector size when a source doesn't report one (disk images).
+/// Physical disks report their true logical sector size via
+/// [`BlockSource::sector_size`] — notably 4096 on "4Kn" drives, where
+/// the GPT header and all LBAs are in 4096-byte units.
 pub const SECTOR_SIZE: u64 = 512;
 
 /// A discovered partition on a disk.
@@ -77,7 +78,9 @@ pub const APPLE_HFS_PLUS_GUID: &str = "48465300-0000-11AA-AA11-00306543ECAC";
 pub const APPLE_APFS_CONTAINER_GUID: &str = "7C3457EF-0000-11AA-AA11-00306543ECAC";
 
 fn try_gpt<S: BlockSource>(source: &mut S) -> anyhow::Result<Option<Vec<Partition>>> {
-    source.seek(SeekFrom::Start(SECTOR_SIZE))?;
+    let sector_size = source.sector_size();
+    // GPT header lives at LBA 1 — byte offset `sector_size` (4096 on 4Kn).
+    source.seek(SeekFrom::Start(sector_size))?;
     let mut header = [0u8; 92];
     if read_exact_or_short(source, &mut header)? < header.len() {
         return Ok(None);
@@ -101,7 +104,7 @@ fn try_gpt<S: BlockSource>(source: &mut S) -> anyhow::Result<Option<Vec<Partitio
         bail!("GPT header looks corrupt: entry_size={entry_size}, num_entries={num_entries}");
     }
 
-    source.seek(SeekFrom::Start(part_entry_lba * SECTOR_SIZE))?;
+    source.seek(SeekFrom::Start(part_entry_lba * sector_size))?;
     let mut buf = vec![0u8; entry_size];
     let mut out = Vec::new();
 
@@ -133,8 +136,8 @@ fn try_gpt<S: BlockSource>(source: &mut S) -> anyhow::Result<Option<Vec<Partitio
         out.push(Partition {
             name,
             type_id: type_guid,
-            start_byte: start_lba * SECTOR_SIZE,
-            length_bytes: (end_lba.saturating_sub(start_lba) + 1) * SECTOR_SIZE,
+            start_byte: start_lba * sector_size,
+            length_bytes: (end_lba.saturating_sub(start_lba) + 1) * sector_size,
             scheme: PartitionScheme::Gpt,
         });
     }

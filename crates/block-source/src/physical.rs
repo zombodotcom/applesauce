@@ -19,7 +19,10 @@ use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
-use windows::Win32::System::Ioctl::{GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO};
+use windows::Win32::System::Ioctl::{
+    DISK_GEOMETRY, GET_LENGTH_INFORMATION, IOCTL_DISK_GET_DRIVE_GEOMETRY,
+    IOCTL_DISK_GET_LENGTH_INFO,
+};
 use windows::Win32::System::IO::DeviceIoControl;
 
 use crate::BlockSource;
@@ -92,6 +95,12 @@ impl PhysicalDisk {
             }
         };
 
+        // Logical sector size governs both raw-read alignment and the
+        // unit GPT/APM addresses are expressed in. "4Kn" drives report
+        // 4096; reads aligned to only 512 fail there with ERROR_INVALID_
+        // PARAMETER. Fall back to 512 if the query fails.
+        let sector_size = query_sector_size(handle).unwrap_or(512);
+
         // Hand ownership of the HANDLE to std::fs::File. From here on,
         // closing happens automatically when File drops.
         let raw: RawHandle = handle.0 as RawHandle;
@@ -99,8 +108,7 @@ impl PhysicalDisk {
 
         Ok(Self {
             inner,
-            sector_size: 512, // Conservative default. Refine via
-            // IOCTL_DISK_GET_DRIVE_GEOMETRY_EX later.
+            sector_size,
             length,
             pos: 0,
             cache: vec![0; CACHE_SIZE],
@@ -178,6 +186,10 @@ impl BlockSource for PhysicalDisk {
     fn len_bytes(&self) -> Option<u64> {
         Some(self.length)
     }
+
+    fn sector_size(&self) -> u64 {
+        self.sector_size as u64
+    }
 }
 
 fn open_handle(drive_number: u32) -> io::Result<HANDLE> {
@@ -198,6 +210,36 @@ fn open_handle(drive_number: u32) -> io::Result<HANDLE> {
         )
         .map_err(|e: windows::core::Error| io::Error::other(e.message()))
     }
+}
+
+/// Query the disk's logical bytes-per-sector via
+/// `IOCTL_DISK_GET_DRIVE_GEOMETRY`. Returns the `BytesPerSector` field.
+fn query_sector_size(handle: HANDLE) -> io::Result<u32> {
+    let mut geo: MaybeUninit<DISK_GEOMETRY> = MaybeUninit::uninit();
+    let mut returned: u32 = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_DISK_GET_DRIVE_GEOMETRY,
+            None,
+            0,
+            Some(geo.as_mut_ptr() as *mut c_void),
+            std::mem::size_of::<DISK_GEOMETRY>() as u32,
+            Some(&mut returned),
+            None,
+        )
+    };
+    if let Err(e) = ok {
+        return Err(io::Error::other(e.message()));
+    }
+    let geo = unsafe { geo.assume_init() };
+    let bps = geo.BytesPerSector;
+    if bps == 0 || !bps.is_power_of_two() {
+        return Err(io::Error::other(format!(
+            "implausible BytesPerSector {bps}"
+        )));
+    }
+    Ok(bps)
 }
 
 fn query_length(handle: HANDLE) -> io::Result<u64> {
