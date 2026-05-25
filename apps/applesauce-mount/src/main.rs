@@ -42,6 +42,7 @@ mod win {
     use block_source::partition::{self, Partition, PartitionScheme};
     use block_source::window::Window;
     use block_source::BlockSource;
+    use fs_core::apfs::ApfsContainer;
     use fs_core::hfsplus::Hfsplus;
 
     pub fn run() -> ExitCode {
@@ -80,10 +81,12 @@ mod win {
         let exe_str = exe.to_string_lossy().to_string();
 
         // CommandLine template substituted by the launcher:
-        //   %1 = disk number, %2 = drive letter
-        // launchctl invocation will be:
-        //   launchctl-x64 start applesauce <instance-id> <disk-num> <letter>
-        let cmdline = "--disk %1 %2";
+        //   %1 = disk number, %2 = drive letter,
+        //   %3 = partition byte offset, %4 = volume selector
+        //        ("hfs" for HFS+, or an APFS volume index)
+        // launchctl invocation:
+        //   launchctl-x64 start applesauce <id> <disk> <letter> <offset> <sel>
+        let cmdline = "--disk %1 %2 %3 %4";
 
         reg_set(REG_BASE, "Executable", RegType::Sz, &exe_str)?;
         reg_set(REG_BASE, "CommandLine", RegType::Sz, cmdline)?;
@@ -147,7 +150,15 @@ mod win {
                     .ok_or_else(|| anyhow::anyhow!("missing drive letter (e.g. Z:)"))?
                     .clone();
                 let source = block_source::physical::PhysicalDisk::open(n)?;
-                let host = open_and_mount(source, &mountpoint)?;
+                // Optional explicit selection: <offset> <selector>. When
+                // absent, fall back to auto-detecting the first Mac fs.
+                let host = match (args.get(3), args.get(4)) {
+                    (Some(offset), Some(sel)) => {
+                        let offset: u64 = offset.parse()?;
+                        open_and_mount_selected(source, offset, sel, &mountpoint)?
+                    }
+                    _ => open_and_mount(source, &mountpoint)?,
+                };
                 (mountpoint, host)
             }
             image_path => {
@@ -191,6 +202,50 @@ mod win {
              Requires WinFsp (https://winfsp.dev/).",
             env!("CARGO_PKG_VERSION"),
         );
+    }
+
+    /// Mount a specific volume identified by its partition `offset` and
+    /// a `selector`: `"hfs"` for an HFS+ partition, or an APFS volume
+    /// index (the position within its container's volume list). The
+    /// partition length is recovered by re-probing the table.
+    fn open_and_mount_selected<S: BlockSource + 'static>(
+        mut source: S,
+        offset: u64,
+        selector: &str,
+        mountpoint: &str,
+    ) -> anyhow::Result<winfsp_bridge::MountedHost> {
+        let parts = partition::probe(&mut source)?;
+        let part = parts
+            .iter()
+            .find(|p| p.start_byte == offset)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no partition at offset {offset}"))?;
+        let (start, length) = (part.start_byte, part.length_bytes);
+        let window = Window::new(source, start, length)?;
+
+        if selector.eq_ignore_ascii_case("hfs") {
+            let fs = Hfsplus::open(window, 0)?;
+            return winfsp_bridge::mount(fs, length, mountpoint);
+        }
+
+        // APFS: selector is the volume index within the container.
+        let index: usize = selector
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad APFS volume selector {selector:?}"))?;
+        let mut container = ApfsContainer::open(window)?;
+        let vols = container.volumes()?;
+        let info = vols
+            .get(index)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("APFS volume index {index} out of range"))?;
+        if info.encrypted {
+            anyhow::bail!(
+                "APFS volume “{}” is FileVault-encrypted; mounting needs the key",
+                info.name
+            );
+        }
+        let vol = container.open_volume(&info)?;
+        winfsp_bridge::mount(vol, length, mountpoint)
     }
 
     fn open_and_mount<S: BlockSource + 'static>(

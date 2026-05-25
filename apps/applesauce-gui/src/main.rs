@@ -77,9 +77,10 @@ mod app {
     /// front as new events arrive — the UI shows the most recent batch.
     const PULL_LOG_CAPACITY: usize = 500;
 
-    use block_source::partition::{self, Partition, PartitionScheme};
+    use block_source::partition::{self, Partition, PartitionScheme, APPLE_APFS_CONTAINER_GUID};
     use block_source::physical::{self, DiskInfo, PhysicalDisk};
     use block_source::window::Window;
+    use fs_core::apfs::ApfsContainer;
     use fs_core::hfsplus::Hfsplus;
     use fs_core::pull::{pull_tree, sanitize_name, PullEvent, PullOptions, PullStats};
     use fs_core::{DirEntry, MacFilesystem};
@@ -90,7 +91,22 @@ mod app {
     /// Service "class name" registered with WinFsp.Launcher.
     const SERVICE_CLASS: &str = "applesauce";
 
-    /// A scanned Mac-typed partition we know how to mount.
+    /// Whether a scanned row is an HFS+ partition or one volume inside
+    /// an APFS container (which holds several). Carries what the mount
+    /// binary needs as its volume selector.
+    #[derive(Clone)]
+    enum VolumeKind {
+        Hfs,
+        /// One volume of an APFS container, by its index in the
+        /// container's volume list.
+        Apfs {
+            volume_index: usize,
+        },
+    }
+
+    /// A scanned Mac volume we know how to mount. For APFS, `start_byte`
+    /// / `length_bytes` describe the *container* partition and `kind`
+    /// pins down which volume inside it.
     #[derive(Clone)]
     struct ScannedVolume {
         drive_number: u32,
@@ -98,6 +114,52 @@ mod app {
         volume_label: String,
         start_byte: u64,
         length_bytes: u64,
+        kind: VolumeKind,
+    }
+
+    /// Stable per-row identity: (drive number, partition offset,
+    /// volume selector). APFS sibling volumes share drive+offset but
+    /// differ by selector.
+    type RowKey = (u32, u64, String);
+
+    impl ScannedVolume {
+        /// The selector string passed to applesauce-mount: `"hfs"` or
+        /// the APFS volume index.
+        fn selector(&self) -> String {
+            match &self.kind {
+                VolumeKind::Hfs => "hfs".to_string(),
+                VolumeKind::Apfs { volume_index } => volume_index.to_string(),
+            }
+        }
+
+        fn row_key(&self) -> RowKey {
+            (self.drive_number, self.start_byte, self.selector())
+        }
+
+        /// Prefix of the launchctl instance name for this volume's
+        /// mount, used to detect "already mounted".
+        fn instance_prefix(&self) -> String {
+            format!("d{}-{}-", self.drive_number, self.selector())
+        }
+    }
+
+    /// Open a scanned volume as a boxed [`MacFilesystem`], picking the
+    /// HFS+ or APFS reader by its [`VolumeKind`]. Each call opens its own
+    /// disk handle, so browse and pull don't contend.
+    fn open_volume_fs(v: &ScannedVolume) -> anyhow::Result<Box<dyn MacFilesystem>> {
+        let source = PhysicalDisk::open(v.drive_number)?;
+        let window = Window::new(source, v.start_byte, v.length_bytes)?;
+        match &v.kind {
+            VolumeKind::Hfs => Ok(Box::new(Hfsplus::open(window, 0)?)),
+            VolumeKind::Apfs { volume_index } => {
+                let mut container = ApfsContainer::open(window)?;
+                let vols = container.volumes()?;
+                let info = vols.get(*volume_index).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("APFS volume index {volume_index} out of range")
+                })?;
+                Ok(Box::new(container.open_volume(&info)?))
+            }
+        }
     }
 
     enum ScanResult {
@@ -175,10 +237,11 @@ mod app {
         scanning: Option<(JoinHandle<()>, Receiver<ScanResult>)>,
         mounting: Option<(JoinHandle<()>, Receiver<LaunchResult>)>,
         pulling: Option<PullProgress>,
-        // Per-row drive-letter selection.
-        chosen_letter: HashMap<(u32, u64), String>,
+        // Per-row drive-letter selection, keyed by (drive, partition
+        // offset, volume selector) so sibling APFS volumes are distinct.
+        chosen_letter: HashMap<RowKey, String>,
         // Per-row source path for inline (single-path) Pull.
-        pull_src: HashMap<(u32, u64), String>,
+        pull_src: HashMap<RowKey, String>,
         // When true, pulls skip any destination file that already
         // exists by name — regardless of size or mtime. Lets a user
         // pre-populate the destination by hand and have pull touch
@@ -292,12 +355,20 @@ mod app {
                 None => return,
             };
             let drive_number = v.drive_number;
-            let instance = format!("disk{drive_number}-{}", letter.replace(':', ""));
+            let offset = v.start_byte;
+            let selector = v.selector();
+            // Instance encodes disk + volume selector + letter so sibling
+            // APFS volumes get distinct mounts (and the volume list can
+            // tell which row is mounted).
+            let instance = format!("{}{}", v.instance_prefix(), letter.replace(':', ""));
             let mountpoint = letter;
             let (tx, rx) = mpsc::channel::<LaunchResult>();
             let instance_for_thread = instance.clone();
             let mountpoint_for_thread = mountpoint.clone();
             let handle = thread::spawn(move || {
+                // launchctl args fill the registered CommandLine template
+                // `--disk %1 %2 %3 %4`: disk, letter, partition offset,
+                // volume selector ("hfs" or an APFS volume index).
                 let out = Command::new(&launchctl)
                     .args([
                         "start",
@@ -305,6 +376,8 @@ mod app {
                         &instance_for_thread,
                         &drive_number.to_string(),
                         &mountpoint_for_thread,
+                        &offset.to_string(),
+                        &selector,
                     ])
                     .output();
                 let res = match out {
@@ -644,7 +717,7 @@ mod app {
                     ui.horizontal(|ui| {
                         ui.colored_label(
                             egui::Color32::from_rgb(220, 120, 0),
-                            "Service not registered. Click → ",
+                            "Mount service not registered (or out of date). Click → ",
                         );
                         if ui.button("Install service (UAC prompt)").clicked() {
                             self.install_service();
@@ -835,8 +908,8 @@ mod app {
         admin: bool,
         service_installed: bool,
         launchctl_present: bool,
-        chosen_letter: &mut HashMap<(u32, u64), String>,
-        pull_src: &mut HashMap<(u32, u64), String>,
+        chosen_letter: &mut HashMap<RowKey, String>,
+        pull_src: &mut HashMap<RowKey, String>,
         scan_idle: bool,
         mount_request: &mut Option<(usize, String)>,
         pull_request: &mut Option<(usize, String)>,
@@ -845,7 +918,7 @@ mod app {
     ) {
         ui.heading("Mac volumes");
         if volumes.is_empty() && scan_idle && admin {
-            ui.label("No HFS+ volumes detected. Plug in a Mac drive, then click Rescan.");
+            ui.label("No Mac volumes detected. Plug in a Mac drive, then click Rescan.");
         }
 
         let active_letters: HashSet<String> = active.iter().map(|m| m.mountpoint.clone()).collect();
@@ -860,19 +933,23 @@ mod app {
                         v.volume_label.as_str()
                     };
                     ui.strong(title);
+                    let kind_tag = match v.kind {
+                        VolumeKind::Hfs => "HFS+",
+                        VolumeKind::Apfs { .. } => "APFS",
+                    };
                     ui.small(format!(
-                        "Disk {} · partition “{}” · {:.2} GiB",
+                        "Disk {} · {} · partition “{}” · {:.2} GiB",
                         v.drive_number,
+                        kind_tag,
                         v.partition_label,
                         v.length_bytes as f64 / (1u64 << 30) as f64
                     ));
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let key = (v.drive_number, v.start_byte);
-                    let already_at = active
-                        .iter()
-                        .find(|m| m.instance.starts_with(&format!("disk{}-", v.drive_number)));
+                    let key = v.row_key();
+                    let prefix = v.instance_prefix();
+                    let already_at = active.iter().find(|m| m.instance.starts_with(&prefix));
 
                     // Browse (opens dedicated tree view).
                     if ui
@@ -889,7 +966,9 @@ mod app {
                     ui.separator();
 
                     // Quick single-path Pull controls.
-                    let src = pull_src.entry(key).or_insert_with(|| "/Users".to_string());
+                    let src = pull_src
+                        .entry(key.clone())
+                        .or_insert_with(|| "/Users".to_string());
                     if ui
                         .add_enabled(!busy_pulling && admin, egui::Button::new("Pull…"))
                         .on_hover_text(
@@ -915,7 +994,7 @@ mod app {
                             egui::Button::new(format!("Mounted ({})", m.mountpoint)),
                         );
                     } else {
-                        let chosen = chosen_letter.entry(key).or_insert_with(|| {
+                        let chosen = chosen_letter.entry(key.clone()).or_insert_with(|| {
                             first_free_letter(&active_letters).unwrap_or_else(|| "Z:".to_string())
                         });
                         if ui
@@ -927,7 +1006,7 @@ mod app {
                         {
                             *mount_request = Some((i, chosen.clone()));
                         }
-                        egui::ComboBox::from_id_salt(("letter", key))
+                        egui::ComboBox::from_id_salt(("letter", &key))
                             .selected_text(chosen.as_str())
                             .show_ui(ui, |ui| {
                                 for letter in candidate_letters(&active_letters) {
@@ -1135,9 +1214,7 @@ mod app {
         log: Arc<Mutex<VecDeque<String>>>,
         skip_existing: bool,
     ) -> anyhow::Result<PullStats> {
-        let source = PhysicalDisk::open(vol.drive_number)?;
-        let window = Window::new(source, vol.start_byte, vol.length_bytes)?;
-        let mut fs = Hfsplus::open(window, 0)?;
+        let mut fs = open_volume_fs(vol)?;
         let opts = PullOptions {
             skip_existing,
             ..PullOptions::default()
@@ -1191,7 +1268,7 @@ mod app {
                 _ => {}
             };
 
-            let stats = pull_tree(&mut fs, src_path, dst_parent, &opts, cancel, &mut on_event)?;
+            let stats = pull_tree(&mut *fs, src_path, dst_parent, &opts, cancel, &mut on_event)?;
             total.files += stats.files;
             total.dirs += stats.dirs;
             total.bytes += stats.bytes;
@@ -1217,9 +1294,7 @@ mod app {
     /// — the browse UI doesn't want to surface `.Spotlight-V100` /
     /// `.fseventsd` / private-data folders.
     fn list_dir_once(vol: &ScannedVolume, path: &str) -> anyhow::Result<Vec<DirEntry>> {
-        let source = PhysicalDisk::open(vol.drive_number)?;
-        let window = Window::new(source, vol.start_byte, vol.length_bytes)?;
-        let mut fs = Hfsplus::open(window, 0)?;
+        let mut fs = open_volume_fs(vol)?;
         let mut entries = fs.list_dir(path)?;
         entries.retain(|e| !is_hidden_in_browser(&e.name));
         Ok(entries)
@@ -1282,19 +1357,62 @@ mod app {
             if !p.is_mac_filesystem() {
                 continue;
             }
-            let volume_label = read_volume_label(disk.drive_number, &p).unwrap_or_default();
+            if is_apfs_container(&p) {
+                // One container → potentially several volumes; emit a row
+                // per volume. A failure to read the container is logged
+                // and skipped rather than aborting the whole scan.
+                match scan_apfs_container(disk.drive_number, &p) {
+                    Ok(mut vols) => out.append(&mut vols),
+                    Err(e) => tracing::warn!(
+                        "scan: APFS container “{}” on disk {} skipped: {e:#}",
+                        p.name,
+                        disk.drive_number
+                    ),
+                }
+                continue;
+            }
+            let volume_label = read_hfs_label(disk.drive_number, &p).unwrap_or_default();
             out.push(ScannedVolume {
                 drive_number: disk.drive_number,
                 partition_label: p.name.clone(),
                 volume_label,
                 start_byte: p.start_byte,
                 length_bytes: p.length_bytes,
+                kind: VolumeKind::Hfs,
             });
         }
         Ok(out)
     }
 
-    fn read_volume_label(drive_number: u32, p: &Partition) -> anyhow::Result<String> {
+    fn is_apfs_container(p: &Partition) -> bool {
+        matches!(
+            p.type_id.as_str(),
+            APPLE_APFS_CONTAINER_GUID | "Apple_APFS" | "Apple_APFS_Container"
+        )
+    }
+
+    /// Enumerate the volumes inside an APFS container partition, one
+    /// `ScannedVolume` each (carrying the volume's index for mounting).
+    fn scan_apfs_container(drive_number: u32, p: &Partition) -> anyhow::Result<Vec<ScannedVolume>> {
+        let source = PhysicalDisk::open(drive_number)?;
+        let window = Window::new(source, p.start_byte, p.length_bytes)?;
+        let mut container = ApfsContainer::open(window)?;
+        let vols = container.volumes()?;
+        Ok(vols
+            .into_iter()
+            .enumerate()
+            .map(|(i, info)| ScannedVolume {
+                drive_number,
+                partition_label: p.name.clone(),
+                volume_label: info.name,
+                start_byte: p.start_byte,
+                length_bytes: p.length_bytes,
+                kind: VolumeKind::Apfs { volume_index: i },
+            })
+            .collect())
+    }
+
+    fn read_hfs_label(drive_number: u32, p: &Partition) -> anyhow::Result<String> {
         let source = PhysicalDisk::open(drive_number)?;
         let window = Window::new(source, p.start_byte, p.length_bytes)?;
         let fs = Hfsplus::open(window, 0)?;
@@ -1371,7 +1489,24 @@ mod app {
         else {
             return false;
         };
-        out.status.success()
+        if !out.status.success() {
+            return false;
+        }
+        // The registered CommandLine template must forward the partition
+        // offset + volume selector (%3 %4), or APFS — and explicit HFS+
+        // selection — won't mount. Older installs used `--disk %1 %2`;
+        // treat those as not-current so the GUI prompts a re-install.
+        let Ok(cmd) = Command::new("reg")
+            .args(["query", SERVICE_REG, "/v", "CommandLine", "/reg:32"])
+            .output()
+        else {
+            return false;
+        };
+        if !cmd.status.success() {
+            return false;
+        }
+        let text = String::from_utf8_lossy(&cmd.stdout);
+        text.contains("%3") && text.contains("%4")
     }
 
     fn locate_mount_binary() -> Option<PathBuf> {
