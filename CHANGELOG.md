@@ -7,9 +7,52 @@ API and on-disk-format surface may shift between minor versions.
 
 ## [Unreleased]
 
-## [0.1.0-pre.7] — 2026-05-12
+## [0.1.0-pre.7] — 2026-05-25
 
-### Added
+This release bundles everything since pre.6: the HFS+ wrapper + WinFsp
+launcher work, the resumable `pull` command, and a full read-only
+**APFS** reader (enumerate → list → read → mount → pull), including
+decmpfs decompression and 4Kn-drive support.
+
+### Added — APFS
+- **APFS read-only reader** (`crates/fs-core/src/apfs/`). Parses the
+  container superblock (NXSB, via a checkpoint-descriptor scan for the
+  live superblock), the object map (OMAP B-tree), and the per-volume
+  file-system B-tree (j-records: inodes, directory entries, extents,
+  xattrs). Resolves virtual object ids through the volume OMAP at the
+  superblock's transaction id. Little-endian throughout. Implements the
+  `MacFilesystem` trait so it plugs into mount / browse / pull.
+- **decmpfs transparent compression.** Files behind the
+  `com.apple.decmpfs` xattr are decompressed on read: zlib (via
+  `flate2`) and LZFSE (via `lzfse_rust`), both inline and resource-fork
+  (chunked) storage, including the `0xFF` "stored literally" escape.
+  LZVN (types 7/8) is detected and reported, not yet decoded.
+- **FileVault detection.** Encrypted volumes are flagged in the GUI and
+  refused by the CLI / mount path with a clear message instead of
+  producing garbage.
+- **APFS CLI** (`applesauce-cat --disk N`): `apfs` (enumerate volumes),
+  `apfs-ls <vol> [path]`, `apfs-cat <vol> <path>`,
+  `apfs-pull <vol> <src> <dst> [--skip-existing]`, and `apfs-bench`.
+- **GUI APFS support.** Scan fans each APFS container into one row per
+  volume; mount/browse/pull route to the right reader. The mount
+  launcher selector grew to carry partition offset + volume index
+  (CommandLine template `--disk %1 %2 %3 %4`); the GUI detects an
+  out-of-date registration and prompts a re-install.
+- **Browse-performance caching.** Per-volume children/path/size caches
+  plus an OMAP-node cache make repeated directory listings (which
+  Explorer does heavily) effectively instant.
+
+### Added — recovery + block layer
+- **`pull` command.** Recursive, restartable copy off a volume without
+  mounting: skips destination files matching by size+mtime, writes each
+  file to `*.applesauce-partial` before atomic rename, and supports
+  `--skip-existing`. Wired into the GUI as Browse → select → Pull with a
+  live progress panel (always-visible Cancel + rolling event log).
+- **4Kn drive support.** `PhysicalDisk` detects the logical sector size
+  (`IOCTL_DISK_GET_DRIVE_GEOMETRY`) and uses it for read alignment and
+  partition LBA math; fixes large USB drives for both APFS and HFS+.
+
+### Added — HFS+ + mounting (earlier in this cycle)
 - **HFS-wrapped HFS+ support.** Mac OS 8.1–10.3 wrote HFS+ volumes
   inside an HFS classic shell ("HFS+ wrapper"). `volume::detect_hfs_wrapper`
   peeks at the MDB at byte 1024, and if it's a `BD` signature with a
@@ -52,6 +95,12 @@ API and on-disk-format surface may shift between minor versions.
   non-admin Explorer.
 - GUI: launches, scans, "Install service" pops UAC once, Mount
   button works without further admin prompts.
+- APFS, on a real 4Kn USB drive with two containers: enumerated all
+  volumes; listed the Data volume root, `/Users`, and a user home;
+  read a multi-block file byte-for-byte (`.DS_Store`, 12 292 B, correct
+  `Bud1` header); and pulled a folder. 49 fs-core unit tests pass
+  (including decmpfs zlib/LZFSE round-trips and synthetic container /
+  fs-tree fixtures).
 
 ## [0.1.0-pre.6] — 2026-05-11
 

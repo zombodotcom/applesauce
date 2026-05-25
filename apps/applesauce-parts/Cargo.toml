@@ -14,3 +14,4 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 block-source = { path = "../../crates/block-source" }
+fs-core = { path = "../../crates/fs-core" }
