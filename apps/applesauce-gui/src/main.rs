@@ -115,6 +115,9 @@ mod app {
         start_byte: u64,
         length_bytes: u64,
         kind: VolumeKind,
+        /// FileVault-encrypted: readable only with the key, which we
+        /// don't have, so mount/browse/pull are disabled.
+        encrypted: bool,
     }
 
     /// Stable per-row identity: (drive number, partition offset,
@@ -147,6 +150,13 @@ mod app {
     /// HFS+ or APFS reader by its [`VolumeKind`]. Each call opens its own
     /// disk handle, so browse and pull don't contend.
     fn open_volume_fs(v: &ScannedVolume) -> anyhow::Result<Box<dyn MacFilesystem>> {
+        if v.encrypted {
+            anyhow::bail!(
+                "“{}” is FileVault-encrypted; reading it needs the password/recovery key \
+                 (not supported)",
+                v.volume_label
+            );
+        }
         let source = PhysicalDisk::open(v.drive_number)?;
         let window = Window::new(source, v.start_byte, v.length_bytes)?;
         match &v.kind {
@@ -932,7 +942,12 @@ mod app {
                     } else {
                         v.volume_label.as_str()
                     };
-                    ui.strong(title);
+                    ui.horizontal(|ui| {
+                        ui.strong(title);
+                        if v.encrypted {
+                            ui.colored_label(egui::Color32::from_rgb(220, 120, 0), "🔒 encrypted");
+                        }
+                    });
                     let kind_tag = match v.kind {
                         VolumeKind::Hfs => "HFS+",
                         VolumeKind::Apfs { .. } => "APFS",
@@ -950,10 +965,27 @@ mod app {
                     let key = v.row_key();
                     let prefix = v.instance_prefix();
                     let already_at = active.iter().find(|m| m.instance.starts_with(&prefix));
+                    // FileVault volumes can't be read without the key.
+                    let usable = !v.encrypted;
+
+                    if v.encrypted {
+                        ui.label(
+                            egui::RichText::new("needs FileVault key")
+                                .small()
+                                .color(egui::Color32::from_rgb(220, 120, 0)),
+                        )
+                        .on_hover_text(
+                            "This volume is FileVault-encrypted. Reading it requires the \
+                             password or recovery key, which applesauce doesn't support yet.",
+                        );
+                    }
 
                     // Browse (opens dedicated tree view).
                     if ui
-                        .add_enabled(!busy_pulling && admin, egui::Button::new("Browse…"))
+                        .add_enabled(
+                            !busy_pulling && admin && usable,
+                            egui::Button::new("Browse…"),
+                        )
                         .on_hover_text(
                             "Open a tree view of the volume. Check folders to pull, then \
                              click Pull selected.",
@@ -970,7 +1002,7 @@ mod app {
                         .entry(key.clone())
                         .or_insert_with(|| "/Users".to_string());
                     if ui
-                        .add_enabled(!busy_pulling && admin, egui::Button::new("Pull…"))
+                        .add_enabled(!busy_pulling && admin && usable, egui::Button::new("Pull…"))
                         .on_hover_text(
                             "Recursively copy the source path off this volume into \
                              a destination folder you pick. Restartable.",
@@ -999,7 +1031,7 @@ mod app {
                         });
                         if ui
                             .add_enabled(
-                                !busy_mounting && service_installed && launchctl_present,
+                                !busy_mounting && service_installed && launchctl_present && usable,
                                 egui::Button::new("Mount"),
                             )
                             .clicked()
@@ -1379,6 +1411,7 @@ mod app {
                 start_byte: p.start_byte,
                 length_bytes: p.length_bytes,
                 kind: VolumeKind::Hfs,
+                encrypted: false,
             });
         }
         Ok(out)
@@ -1408,6 +1441,7 @@ mod app {
                 start_byte: p.start_byte,
                 length_bytes: p.length_bytes,
                 kind: VolumeKind::Apfs { volume_index: i },
+                encrypted: info.encrypted,
             })
             .collect())
     }
