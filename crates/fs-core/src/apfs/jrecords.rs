@@ -116,6 +116,74 @@ pub fn parse_inode_val(val: &[u8]) -> Option<InodeVal> {
     })
 }
 
+// --- file extents + data stream ------------------------------------
+
+/// Mask selecting the byte length in `j_file_extent_val.len_and_flags`.
+const J_FILE_EXTENT_LEN_MASK: u64 = 0x00ff_ffff_ffff_ffff;
+
+/// A file extent: a contiguous mapping of a file's logical byte range
+/// to physical blocks.
+#[derive(Debug, Clone, Copy)]
+pub struct FileExtent {
+    /// Logical byte offset within the file.
+    pub logical_addr: u64,
+    /// Length in bytes.
+    pub len: u64,
+    /// Starting physical block number (container addressing). Zero means
+    /// a sparse hole.
+    pub phys_block: u64,
+}
+
+/// Parse a FILE_EXTENT key → its logical byte offset (`logical_addr`).
+pub fn parse_file_extent_key(key: &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(key.get(8..16)?.try_into().unwrap()))
+}
+
+/// Parse a FILE_EXTENT value → `(len_bytes, phys_block)`.
+pub fn parse_file_extent_val(val: &[u8]) -> Option<(u64, u64)> {
+    let len_and_flags = u64::from_le_bytes(val.get(0..8)?.try_into().unwrap());
+    let phys_block = u64::from_le_bytes(val.get(8..16)?.try_into().unwrap());
+    Some((len_and_flags & J_FILE_EXTENT_LEN_MASK, phys_block))
+}
+
+/// Inode extended-field type for the data stream (`j_dstream_t`), whose
+/// first u64 is the file's logical size.
+const INO_EXT_TYPE_DSTREAM: u8 = 8;
+/// Fixed portion of `j_inode_val_t` before the extended fields.
+const INODE_FIXED_LEN: usize = 92;
+
+fn align8(x: usize) -> usize {
+    (x + 7) & !7
+}
+
+/// Extract a file inode's logical size from its data-stream extended
+/// field (`INO_EXT_TYPE_DSTREAM`). Returns `None` if the inode has no
+/// data stream (e.g. an empty file or a directory).
+pub fn parse_inode_size(val: &[u8]) -> Option<u64> {
+    // xf_blob_t follows the fixed inode: { u16 num_exts; u16 used_data; }
+    let num_exts = u16::from_le_bytes(
+        val.get(INODE_FIXED_LEN..INODE_FIXED_LEN + 2)?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let headers = INODE_FIXED_LEN + 4;
+    // Values follow the header array, 8-byte aligned.
+    let mut value_off = align8(headers + num_exts * 4);
+    for i in 0..num_exts {
+        let h = headers + i * 4;
+        let x_type = *val.get(h)?;
+        let x_size = u16::from_le_bytes(val.get(h + 2..h + 4)?.try_into().unwrap()) as usize;
+        if x_type == INO_EXT_TYPE_DSTREAM {
+            // j_dstream_t.size is the first u64.
+            return Some(u64::from_le_bytes(
+                val.get(value_off..value_off + 8)?.try_into().unwrap(),
+            ));
+        }
+        value_off += align8(x_size);
+    }
+    None
+}
+
 /// APFS timestamps are nanoseconds since the Unix epoch.
 fn ns_to_systemtime(ns: u64) -> Option<SystemTime> {
     if ns == 0 {

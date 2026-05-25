@@ -27,7 +27,7 @@ use block_source::image::ImageFile;
 use block_source::partition::{self, Partition, PartitionScheme, APPLE_APFS_CONTAINER_GUID};
 use block_source::window::Window;
 use block_source::BlockSource;
-use fs_core::apfs::ApfsContainer;
+use fs_core::apfs::{ApfsContainer, ApfsVolume};
 use fs_core::hfsplus::Hfsplus;
 use fs_core::pull::{pull_tree, PullEvent, PullOptions};
 use fs_core::MacFilesystem;
@@ -74,6 +74,48 @@ fn run(args: &[String]) -> anyhow::Result<()> {
                     path,
                 );
             }
+            if command == "apfs-cat" {
+                let vol = rest
+                    .first()
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("apfs-cat needs a volume name"))?;
+                let path = rest
+                    .get(1)
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("apfs-cat needs a file path"))?;
+                return cmd_apfs_cat(
+                    move || Ok(block_source::physical::PhysicalDisk::open(n)?),
+                    vol,
+                    path,
+                );
+            }
+            if command == "apfs-pull" {
+                let skip_existing = rest.contains(&"--skip-existing");
+                let pos: Vec<&str> = rest
+                    .iter()
+                    .copied()
+                    .filter(|a| !a.starts_with("--"))
+                    .collect();
+                let vol = pos
+                    .first()
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("apfs-pull needs a volume name"))?;
+                let src = pos
+                    .get(1)
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("apfs-pull needs a source path"))?;
+                let dst = pos
+                    .get(2)
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("apfs-pull needs a destination dir"))?;
+                return cmd_apfs_pull(
+                    move || Ok(block_source::physical::PhysicalDisk::open(n)?),
+                    vol,
+                    src,
+                    Path::new(dst),
+                    skip_existing,
+                );
+            }
             let source = block_source::physical::PhysicalDisk::open(n)?;
             let (volume_offset, mut fs) = open_first_hfsplus(source)?;
             return dispatch(command, &rest, &mut fs, volume_offset);
@@ -101,6 +143,20 @@ fn run(args: &[String]) -> anyhow::Result<()> {
         let path = rest.get(1).copied().unwrap_or("/").to_string();
         let img = image_path.clone();
         return cmd_apfs_ls(move || Ok(ImageFile::open(&img)?), &vol, &path);
+    }
+    if command == "apfs-cat" {
+        let vol = rest
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("apfs-cat needs a volume name"))?
+            .to_string();
+        let path = rest
+            .get(1)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("apfs-cat needs a file path"))?
+            .to_string();
+        let img = image_path.clone();
+        return cmd_apfs_cat(move || Ok(ImageFile::open(&img)?), &vol, &path);
     }
 
     let source = ImageFile::open(image_path)?;
@@ -156,7 +212,10 @@ where
 /// List a directory inside a named APFS volume. Searches every APFS
 /// container on the source for a volume whose name matches `vol_name`
 /// (case-insensitive), opens it, and lists `path`.
-fn cmd_apfs_ls<S, F>(open: F, vol_name: &str, path: &str) -> anyhow::Result<()>
+/// Search every APFS container on the source for a volume named
+/// `vol_name` (case-insensitive) and open it. `open` yields a fresh
+/// source per call so each container gets an independent window.
+fn find_apfs_volume<S, F>(open: F, vol_name: &str) -> anyhow::Result<ApfsVolume<Window<S>>>
 where
     S: BlockSource + 'static,
     F: Fn() -> anyhow::Result<S>,
@@ -206,24 +265,109 @@ where
                     info.name
                 );
             }
-            let mut fs = container.open_volume(&info)?;
-            let entries = fs.list_dir(path)?;
-            println!("{} {}  ({} entries)", info.name, path, entries.len());
-            if entries.is_empty() {
-                println!("(empty)");
-                return Ok(());
-            }
-            println!("{:<6}  NAME", "KIND");
-            for e in entries {
-                println!("{:<6}  {}", if e.is_dir { "DIR" } else { "FILE" }, e.name);
-            }
-            println!("\n(note: file sizes/contents arrive in M3)");
-            return Ok(());
+            return container.open_volume(&info);
         }
         available.extend(vols.into_iter().map(|v| v.name));
     }
 
     anyhow::bail!("volume {vol_name:?} not found. Available volumes: {available:?}");
+}
+
+fn cmd_apfs_ls<S, F>(open: F, vol_name: &str, path: &str) -> anyhow::Result<()>
+where
+    S: BlockSource + 'static,
+    F: Fn() -> anyhow::Result<S>,
+{
+    let mut fs = find_apfs_volume(open, vol_name)?;
+    let entries = fs.list_dir(path)?;
+    println!("{path}  ({} entries)", entries.len());
+    if entries.is_empty() {
+        println!("(empty)");
+        return Ok(());
+    }
+    println!("{:<6}  {:>14}  NAME", "KIND", "SIZE");
+    for e in entries {
+        println!(
+            "{:<6}  {:>14}  {}",
+            if e.is_dir { "DIR" } else { "FILE" },
+            e.size_bytes,
+            e.name,
+        );
+    }
+    Ok(())
+}
+
+fn cmd_apfs_pull<S, F>(
+    open: F,
+    vol_name: &str,
+    src: &str,
+    dst_dir: &Path,
+    skip_existing: bool,
+) -> anyhow::Result<()>
+where
+    S: BlockSource + 'static,
+    F: Fn() -> anyhow::Result<S>,
+{
+    let mut fs = find_apfs_volume(open, vol_name)?;
+    let start = Instant::now();
+    let opts = PullOptions {
+        skip_existing,
+        ..PullOptions::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let mut files_seen = 0u64;
+    let mut last = Instant::now();
+    let mut on_event = |ev: PullEvent| match ev {
+        PullEvent::Error { src, message } => eprintln!("  ! {src}: {message}"),
+        PullEvent::FinishedFile { .. } => {
+            files_seen += 1;
+            if last.elapsed().as_millis() >= 250 {
+                last = Instant::now();
+                eprint!("  {files_seen} files done\r");
+                let _ = std::io::stderr().flush();
+            }
+        }
+        _ => {}
+    };
+    let stats = pull_tree(&mut fs, src, dst_dir, &opts, &cancel, &mut on_event)?;
+    let secs = start.elapsed().as_secs_f64();
+    let mb = stats.bytes as f64 / (1u64 << 20) as f64;
+    eprintln!(
+        "\npull complete: {} files / {} dirs / {:.2} MiB in {:.1}s ({:.1} MiB/s), {} skipped, {} errors",
+        stats.files,
+        stats.dirs,
+        mb,
+        secs,
+        if secs > 0.0 { mb / secs } else { 0.0 },
+        stats.skipped,
+        stats.errors,
+    );
+    Ok(())
+}
+
+fn cmd_apfs_cat<S, F>(open: F, vol_name: &str, path: &str) -> anyhow::Result<()>
+where
+    S: BlockSource + 'static,
+    F: Fn() -> anyhow::Result<S>,
+{
+    let mut fs = find_apfs_volume(open, vol_name)?;
+    let st = fs.stat(path)?;
+    if st.is_dir {
+        anyhow::bail!("{path} is a directory");
+    }
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut offset = 0u64;
+    let mut stdout = std::io::stdout().lock();
+    while offset < st.size_bytes {
+        let n = fs.read_file_range(path, offset, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        stdout.write_all(&buf[..n])?;
+        offset += n as u64;
+    }
+    stdout.flush()?;
+    Ok(())
 }
 
 fn print_container<S: BlockSource>(
@@ -318,7 +462,9 @@ fn print_usage() {
            applesauce-cat <image> apfs-ls <vol> [path]  # list a dir in an APFS volume\n  \
            applesauce-cat --disk N [...]                # read \\\\.\\PhysicalDriveN (Admin)\n  \
            applesauce-cat --disk N apfs                 # enumerate APFS volumes on a disk\n  \
-           applesauce-cat --disk N apfs-ls <vol> [path] # list a dir in an APFS volume\n\
+           applesauce-cat --disk N apfs-ls <vol> [path] # list a dir in an APFS volume\n  \
+           applesauce-cat --disk N apfs-cat <vol> <path> # dump an APFS file to stdout\n  \
+           applesauce-cat --disk N apfs-pull <vol> <src> <dst> [--skip-existing]  # recover APFS files\n\
          \n\
          pull is restartable: it skips destination files whose size and\n\
          mtime already match the source, and writes each in-flight file\n\

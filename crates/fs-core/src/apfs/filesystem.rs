@@ -18,18 +18,27 @@
 //! walks components from the root inode, matching names linearly (so we
 //! don't need to reimplement APFS's name-hash).
 //!
-//! File reads (extents) land in M3; [`read_file_range`] errors until then.
+//! ## Reads
+//!
+//! File sizes come from the inode's data-stream extended field; reads
+//! map a logical offset to a FILE_EXTENT (physical block run) and copy
+//! the bytes, zero-filling sparse holes. Parsed fs-tree nodes and
+//! resolved oid→block mappings are cached so repeated walks (listing a
+//! directory stats every child) stay cheap.
 
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
+use quick_cache::sync::Cache;
 
 use crate::{DirEntry, MacFilesystem, Stat};
 
 use super::btree::{VarKvNode, BTREE_INFO_SIZE};
 use super::jrecords::{
-    parse_drec_name, parse_drec_val, parse_inode_val, DirRec, InodeVal, JKey, APFS_TYPE_DIR_REC,
-    APFS_TYPE_INODE, ROOT_DIR_INO,
+    parse_drec_name, parse_drec_val, parse_file_extent_key, parse_file_extent_val,
+    parse_inode_size, parse_inode_val, DirRec, FileExtent, InodeVal, JKey, APFS_TYPE_DIR_REC,
+    APFS_TYPE_FILE_EXTENT, APFS_TYPE_INODE, ROOT_DIR_INO,
 };
 use super::object::BlockReader;
 use super::omap::Omap;
@@ -43,6 +52,14 @@ const BTREE_PHYSICAL: u32 = 0x0000_0010;
 
 /// Guard against runaway / cyclic trees during a range collect.
 const MAX_NODES_PER_QUERY: usize = 100_000;
+
+/// fs-tree node cache (each node is one block, ~4 KiB). The root and
+/// upper index levels are touched on every query, so this turns a
+/// directory listing from N tree descents into mostly cache hits.
+const NODE_CACHE_CAPACITY: usize = 4096;
+/// Cache of resolved virtual-oid → block-address mappings, so we don't
+/// re-descend the volume object map for hot nodes.
+const PADDR_CACHE_CAPACITY: usize = 16384;
 
 /// A read-only APFS volume.
 pub struct ApfsVolume<S> {
@@ -60,6 +77,8 @@ pub struct ApfsVolume<S> {
     hashed_drec_keys: bool,
     case_insensitive: bool,
     volume_label: String,
+    node_cache: Cache<Oid, Arc<VarKvNode>>,
+    paddr_cache: Cache<Oid, Paddr>,
 }
 
 impl<S: Read + Seek + Send> ApfsVolume<S> {
@@ -101,25 +120,63 @@ impl<S: Read + Seek + Send> ApfsVolume<S> {
             hashed_drec_keys,
             case_insensitive,
             volume_label,
+            node_cache: Cache::new(NODE_CACHE_CAPACITY),
+            paddr_cache: Cache::new(PADDR_CACHE_CAPACITY),
         })
     }
 
-    /// Resolve a tree node's oid to its block address, then read+parse it.
-    fn read_fs_node(&mut self, oid: Oid) -> Result<VarKvNode> {
+    /// Resolve a tree node's virtual oid to its block address, via the
+    /// volume object map (cached).
+    fn resolve_oid(&mut self, oid: Oid) -> Result<Paddr> {
+        if self.physical_tree {
+            return Ok(oid as Paddr);
+        }
+        if let Some(p) = self.paddr_cache.get(&oid) {
+            return Ok(p);
+        }
         let bs = self.block_size;
-        let physical = self.physical_tree;
+        let max_xid = self.max_xid;
         let omap = &self.omap;
         let mut reader = BlockReader::new(&mut self.source, bs);
-        let max_xid = self.max_xid;
-        let paddr = if physical {
-            oid as Paddr
-        } else {
-            omap.lookup(&mut reader, oid, max_xid)?
-                .ok_or_else(|| anyhow!("fs-tree node oid {oid} not in omap"))?
-                .paddr
+        let paddr = omap
+            .lookup(&mut reader, oid, max_xid)?
+            .ok_or_else(|| anyhow!("fs-tree node oid {oid} not in omap"))?
+            .paddr;
+        self.paddr_cache.insert(oid, paddr);
+        Ok(paddr)
+    }
+
+    /// Resolve, read, and parse a tree node, caching the parsed result.
+    fn read_fs_node(&mut self, oid: Oid) -> Result<Arc<VarKvNode>> {
+        if let Some(node) = self.node_cache.get(&oid) {
+            return Ok(node);
+        }
+        let paddr = self.resolve_oid(oid)?;
+        let bs = self.block_size;
+        let block = {
+            let mut reader = BlockReader::new(&mut self.source, bs);
+            reader.read_block(paddr)?
         };
-        let block = reader.read_block(paddr)?;
-        VarKvNode::parse(block)
+        let node = Arc::new(VarKvNode::parse(block)?);
+        self.node_cache.insert(oid, node.clone());
+        Ok(node)
+    }
+
+    /// Read `buf.len()` bytes (or until EOF) starting at an absolute
+    /// container-relative byte offset. Used for file extent data, which
+    /// references physical blocks directly (not through the object map).
+    fn read_at(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<usize> {
+        self.source.seek(SeekFrom::Start(byte_offset))?;
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match self.source.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(filled)
     }
 
     /// Collect every leaf record whose key prefix is `(obj_id, kind)`.
@@ -192,10 +249,39 @@ impl<S: Read + Seek + Send> ApfsVolume<S> {
         Ok(out)
     }
 
-    /// Read an inode record by oid.
-    fn read_inode(&mut self, oid: Oid) -> Result<Option<InodeVal>> {
+    /// Fetch an inode's record value bytes by oid.
+    fn inode_record(&mut self, oid: Oid) -> Result<Option<Vec<u8>>> {
         let recs = self.collect_records(oid, APFS_TYPE_INODE)?;
-        Ok(recs.first().and_then(|(_, val)| parse_inode_val(val)))
+        Ok(recs.into_iter().next().map(|(_, val)| val))
+    }
+
+    /// Logical size of a file inode (0 if it has no data stream).
+    fn inode_size(&mut self, oid: Oid) -> Result<u64> {
+        Ok(self
+            .inode_record(oid)?
+            .and_then(|v| parse_inode_size(&v))
+            .unwrap_or(0))
+    }
+
+    /// All extents of a file, sorted by logical offset.
+    fn file_extents(&mut self, oid: Oid) -> Result<Vec<FileExtent>> {
+        let recs = self.collect_records(oid, APFS_TYPE_FILE_EXTENT)?;
+        let mut exts = Vec::with_capacity(recs.len());
+        for (key, val) in recs {
+            let Some(logical_addr) = parse_file_extent_key(&key) else {
+                continue;
+            };
+            let Some((len, phys_block)) = parse_file_extent_val(&val) else {
+                continue;
+            };
+            exts.push(FileExtent {
+                logical_addr,
+                len,
+                phys_block,
+            });
+        }
+        exts.sort_by_key(|e| e.logical_addr);
+        Ok(exts)
     }
 
     /// Resolve a POSIX path to `(oid, is_dir)`. The root (`/` or empty)
@@ -236,9 +322,16 @@ impl<S: Read + Seek + Send> MacFilesystem for ApfsVolume<S> {
         let children = self.list_children(oid)?;
         let mut out = Vec::with_capacity(children.len());
         for c in children {
+            // Files carry their size in the inode's data stream; reading
+            // it per entry is what lets pull copy the right byte count.
+            let size_bytes = if c.is_dir {
+                0
+            } else {
+                self.inode_size(c.file_id)?
+            };
             out.push(Stat {
                 name: c.name,
-                size_bytes: 0, // file sizes need extent/dstream reads (M3)
+                size_bytes,
                 is_dir: c.is_dir,
                 modified: None,
                 created: None,
@@ -254,18 +347,62 @@ impl<S: Read + Seek + Send> MacFilesystem for ApfsVolume<S> {
             .find(|s| !s.is_empty())
             .unwrap_or("")
             .to_string();
-        let inode = self.read_inode(oid)?;
+        let record = self.inode_record(oid)?;
+        let inode: Option<InodeVal> = record.as_deref().and_then(parse_inode_val);
+        let size_bytes = if is_dir {
+            0
+        } else {
+            record.as_deref().and_then(parse_inode_size).unwrap_or(0)
+        };
         Ok(Stat {
             name,
-            size_bytes: 0, // M3
+            size_bytes,
             is_dir,
             modified: inode.as_ref().and_then(|i| i.modified),
             created: inode.as_ref().and_then(|i| i.created),
         })
     }
 
-    fn read_file_range(&mut self, _path: &str, _offset: u64, _buf: &mut [u8]) -> Result<usize> {
-        bail!("APFS file reads are not implemented yet (M3)");
+    fn read_file_range(&mut self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let (oid, is_dir) = self.resolve_path(path)?;
+        if is_dir {
+            bail!("{path} is a directory");
+        }
+        let size = self.inode_size(oid)?;
+        if offset >= size || buf.is_empty() {
+            return Ok(0);
+        }
+        let bs = self.block_size as u64;
+        let extents = self.file_extents(oid)?;
+
+        // Extent covering `offset`, if any.
+        if let Some(e) = extents
+            .iter()
+            .find(|e| offset >= e.logical_addr && offset < e.logical_addr + e.len)
+        {
+            let into = offset - e.logical_addr;
+            // Clamp to this extent, the file size, and the caller's buffer.
+            let avail = (e.len - into).min(size - offset).min(buf.len() as u64) as usize;
+            if e.phys_block == 0 {
+                // Sparse hole inside the extent → zeros.
+                buf[..avail].fill(0);
+                return Ok(avail);
+            }
+            let phys_byte = e.phys_block * bs + into;
+            return self.read_at(phys_byte, &mut buf[..avail]);
+        }
+
+        // Not covered by any extent: a sparse hole. Zero-fill up to the
+        // next extent (or end of file), bounded by the buffer.
+        let hole_end = extents
+            .iter()
+            .map(|e| e.logical_addr)
+            .filter(|&a| a > offset)
+            .min()
+            .unwrap_or(size);
+        let avail = (hole_end - offset).min(buf.len() as u64) as usize;
+        buf[..avail].fill(0);
+        Ok(avail)
     }
 
     fn volume_label(&self) -> Option<&str> {
@@ -439,5 +576,79 @@ mod tests {
     fn missing_path_errors() {
         let mut vol = build_volume();
         assert!(vol.list_dir("/nope").is_err());
+    }
+
+    /// INODE record value for `oid` with a DSTREAM xfield of `size`.
+    fn inode_with_size(size: u64) -> Vec<u8> {
+        // 92-byte fixed inode, then xf_blob: num_exts=1, one DSTREAM
+        // (type 8) xfield whose value (j_dstream) starts at offset 104.
+        let mut v = vec![0u8; 104 + 40];
+        // mode @80 = S_IFREG so it reads as a file.
+        put_u16(&mut v, 80, 0o100000);
+        put_u16(&mut v, 92, 1); // xf_num_exts
+        put_u16(&mut v, 94, 40); // xf_used_data (approx)
+        v[96] = 8; // x_type = INO_EXT_TYPE_DSTREAM
+        v[97] = 0; // x_flags
+        put_u16(&mut v, 98, 40); // x_size = sizeof(j_dstream)
+        put_u64(&mut v, 104, size); // j_dstream.size
+        v
+    }
+
+    fn jkey(oid: u64, kind: u8) -> [u8; 8] {
+        (((kind as u64) << 60) | oid).to_le_bytes()
+    }
+
+    #[test]
+    fn reads_file_contents_via_extent() {
+        let mut disk = vec![0u8; BS * 8];
+        place(&mut disk, 1, &omap_phys());
+        place(&mut disk, 2, &omap_btree());
+
+        let data = b"hello world";
+        // File extent: logical 0, one block long, physical block 5.
+        let mut ext_key = jkey(17, APFS_TYPE_FILE_EXTENT).to_vec();
+        ext_key.extend_from_slice(&0u64.to_le_bytes()); // logical_addr
+        let mut ext_val = Vec::new();
+        ext_val.extend_from_slice(&(BS as u64).to_le_bytes()); // len_and_flags
+        ext_val.extend_from_slice(&5u64.to_le_bytes()); // phys_block = 5
+        ext_val.extend_from_slice(&0u64.to_le_bytes()); // crypto_id
+
+        let recs = vec![
+            (drec_key(ROOT_DIR_INO, "hello.txt"), drec_val(17, false)),
+            (
+                jkey(17, APFS_TYPE_INODE).to_vec(),
+                inode_with_size(data.len() as u64),
+            ),
+            (ext_key, ext_val),
+        ];
+        place(&mut disk, 3, &fs_leaf(&recs));
+        // File data lives in block 5.
+        disk[5 * BS..5 * BS + data.len()].copy_from_slice(data);
+
+        let mut vol = ApfsVolume::open(
+            Cursor::new(disk),
+            BS as u32,
+            1,
+            1000,
+            Xid::MAX,
+            true,
+            true,
+            "Test".to_string(),
+        )
+        .unwrap();
+
+        // Size is reported from the inode's data stream.
+        let st = vol.stat("/hello.txt").unwrap();
+        assert_eq!(st.size_bytes, data.len() as u64);
+        assert!(!st.is_dir);
+
+        // Reading the file yields the bytes from the extent's block.
+        let mut buf = vec![0u8; 64];
+        let n = vol.read_file_range("/hello.txt", 0, &mut buf).unwrap();
+        assert_eq!(n, data.len());
+        assert_eq!(&buf[..n], data);
+
+        // Reading at/after EOF returns 0.
+        assert_eq!(vol.read_file_range("/hello.txt", 100, &mut buf).unwrap(), 0);
     }
 }
